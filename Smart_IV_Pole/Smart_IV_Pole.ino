@@ -504,7 +504,9 @@ void loop() {
         mqtt.publish(T_ALERT, buf, true);
       }
 
-      if (detector.isWindowFull()) {
+      // 윈도우가 막 완성된 샘플(count==0)에서만 결과 출력,
+      // 다음 샘플부터는 새 윈도우 수집 진행 표시
+      if (detector.getSampleCount() == 0 && detector.isWindowFull()) {
         Serial.printf("[IV] W:%.2fg  flow:%.4f/%.4fg/s  → %s (신뢰도:%.0f%%)\n",
                       iv.currentWeight,
                       iv.currentFlowRate, iv.targetFlowRate,
