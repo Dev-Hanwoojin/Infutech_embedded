@@ -2,39 +2,41 @@
 #include <Arduino.h>
 #include <string.h>
 
-// TFLite Micro — built into ESP32 core 3.3.7 (espressif__esp-tflite-micro)
+// TFLite Micro — ESP32 코어 3.3.7 (espressif__esp-tflite-micro) 내장
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
+// ── 유속 상태 정의 ─────────────────────────────────────────────────
+#define FLOW_FAST    1    // 유속 빠름
+#define FLOW_NORMAL  0    // 정상
+#define FLOW_SLOW   -1    // 유속 느림
 
-// ── constants ─────────────────────────────────────────────────────
-#define FLOW_FAST    1
-#define FLOW_NORMAL  0
-#define FLOW_SLOW   -1
+// ── CNN 윈도우 크기 ────────────────────────────────────────────────
+// 4×4 = 16샘플 = 16초 윈도우 (측정 주기 1초 기준)
+#define CNN_DIM  4
+#define CNN_WIN  (CNN_DIM * CNN_DIM)   // 16샘플
 
-#define CNN_DIM  8
-#define CNN_WIN  (CNN_DIM * CNN_DIM)   // 64-sample rolling window
-
+// ── TFLite Micro 설정 ──────────────────────────────────────────────
 #define TENSOR_ARENA_KB  16
 #define TENSOR_ARENA_SZ  (TENSOR_ARENA_KB * 1024)
 
-// 단일 샘플 허용 오차: ±17%
-// 근거: 중력식 점적 수동 조절 임상 허용 오차 ±15~20% 기준
-// 예시: 목표 60 gtt/min → 50~70 gtt/min 범위를 정상으로 판정
+// ── 판정 임계값 ────────────────────────────────────────────────────
+// 허용 오차 ±17%: 임상 중력식 점적 허용 범위 ±15~20% 기준
+//   예) 목표 60 gtt/min → 50~70 gtt/min 정상 판정
 #define DEFAULT_TOLERANCE    0.17f
-// CNN 결과 신뢰도 임계값: 이 이상일 때만 결과 반영
+// CNN 신뢰도 임계값: 이 이상일 때만 CNN 결과를 최종 판정에 반영
 #define DEFAULT_CNN_THRESH   0.75f
-// Fallback: fast/slow 픽셀 비율이 이 이상이면 이상 판정
+// Fallback 비율 임계값: 이상 픽셀 비율이 이 이상이면 비정상 판정
 #define DEFAULT_RATIO_THRESH 0.40f
 
 /*
- * CNNDetector — 3클래스 분류 (SLOW / NORMAL / FAST)
+ * CNNDetector — 3클래스 유속 분류 (SLOW / NORMAL / FAST)
  *
- * CNN 출력: [P(slow), P(normal), P(fast)]  → argmax로 상태 결정
- * Fallback: 이미지 내 +1/-1 픽셀 비율로 판단
+ * CNN 출력 : [P(slow), P(normal), P(fast)] → argmax로 상태 결정
+ * Fallback : CNN 모델이 없을 때 +1/-1 픽셀 비율로 판단
  *
- * 64샘플(= 64초) 쌓인 후부터 getWindowResult() 유효
+ * 16샘플(= 16초)이 쌓인 뒤부터 getWindowResult() 유효
  */
 class CNNDetector {
 public:
@@ -53,16 +55,16 @@ public:
     memset(_arena, 0, sizeof(_arena));
   }
 
+  // TFLite 모델 초기화. 모델 파일이 없으면 Fallback 모드로 동작.
   bool begin() {
 #ifndef CNN_MODEL_AVAILABLE
-    Serial.println("[CNN] Placeholder model — fallback mode.");
-    Serial.println("[CNN] Run train/train_cnn.py then recompile.");
+    Serial.println("[CNN] 모델 없음 — Fallback 모드 (train/train_cnn.py 실행 후 재컴파일).");
     _useFallback = true;
     return false;
 #else
     _model = tflite::GetModel(cnn_model_data);
     if (_model->version() != TFLITE_SCHEMA_VERSION) {
-      Serial.printf("[CNN] Schema mismatch: model=%u, lib=%u\n",
+      Serial.printf("[CNN] 스키마 버전 불일치: model=%u, lib=%u\n",
                     _model->version(), TFLITE_SCHEMA_VERSION);
       _useFallback = true;
       return false;
@@ -84,23 +86,24 @@ public:
     );
 
     if (_interpreter->AllocateTensors() != kTfLiteOk) {
-      Serial.println("[CNN] AllocateTensors failed — increase TENSOR_ARENA_KB.");
+      Serial.println("[CNN] 텐서 할당 실패 — TENSOR_ARENA_KB 값을 늘려주세요.");
       _useFallback = true;
       return false;
     }
 
-    Serial.printf("[CNN] TFLite ready. Arena used: %u / %u bytes\n",
+    Serial.printf("[CNN] TFLite 준비 완료. 아레나 사용: %u / %u bytes\n",
                   (unsigned)_interpreter->arena_used_bytes(), TENSOR_ARENA_SZ);
 
+    // 입력/출력 텐서 형상 검증 (4×4×1 입력, 3클래스 출력)
     TfLiteTensor *in  = _interpreter->input(0);
     TfLiteTensor *out = _interpreter->output(0);
     bool shapeOK = (in->dims->size == 4)
                 && (in->dims->data[1] == CNN_DIM)
                 && (in->dims->data[2] == CNN_DIM)
                 && (in->dims->data[3] == 1)
-                && (out->dims->data[1] == 3);   // 3클래스
+                && (out->dims->data[1] == 3);
     if (!shapeOK) {
-      Serial.println("[CNN] Tensor shape mismatch — check model.");
+      Serial.println("[CNN] 텐서 형상 불일치 — 모델을 확인하세요.");
       _useFallback = true;
       return false;
     }
@@ -110,32 +113,33 @@ public:
 #endif
   }
 
-  // ── 샘플 추가 ─────────────────────────────────────────────────────
-  void setTolerance(float t)   { _tolerance  = t; }
-  void setCNNThresh(float t)   { _cnnThresh  = t; }
+  // ── 파라미터 설정 ──────────────────────────────────────────────────
+  void setTolerance(float t)   { _tolerance   = t; }
+  void setCNNThresh(float t)   { _cnnThresh   = t; }
   void setRatioThresh(float t) { _ratioThresh = t; }
 
+  // ── 샘플 추가 ─────────────────────────────────────────────────────
+  // measured: 측정 유속(g/s), target: 목표 유속(g/s)
+  // CNN_WIN(16)개 채워지면 자동으로 분류 실행 후 버퍼 초기화
   void addSample(float measured, float target) {
-    _lastState      = encodeState(measured, target);
-    _buf[_head]     = _lastState;
-    _head           = (_head + 1) % CNN_WIN;
+    _lastState  = encodeState(measured, target);
+    _buf[_head] = _lastState;
+    _head       = (_head + 1) % CNN_WIN;
     _count++;
 
-    // 64개 채워지면 CNN 실행 후 버퍼 초기화
-    // 다음 샘플은 새 윈도우의 1번째가 됨
     if (_count >= CNN_WIN) {
       buildImage();
       runClassify();
       _hasResult = true;
-      // 이상 감지 시 1회 알림 플래그 세트
       if (_windowResult != FLOW_NORMAL) _alertPending = true;
-      // 버퍼 초기화 — 다음 64샘플을 새로 수집
+      // 버퍼 초기화 — 다음 16샘플을 새로 수집
       memset(_buf, 0, sizeof(_buf));
       _head  = 0;
       _count = 0;
     }
   }
 
+  // 단일 샘플을 SLOW / NORMAL / FAST 중 하나로 분류
   int encodeState(float measured, float target) {
     if (target <= 0) return FLOW_NORMAL;
     float ratio = (measured - target) / target;
@@ -145,32 +149,26 @@ public:
   }
 
   // ── 결과 조회 ─────────────────────────────────────────────────────
+  int   getWindowResult()     const { return _windowResult;     }  // 윈도우 분류 결과
+  float getWindowConfidence() const { return _windowConfidence; }  // 결과 신뢰도 (0~1)
+  bool  isWindowFull()        const { return _hasResult;        }  // 첫 윈도우 완성 여부
+  int   getSampleCount()      const { return _count;            }  // 현재 수집된 샘플 수
+  int   getLastState()        const { return _lastState;        }  // 최근 단일 샘플 상태
+  bool  isTFLiteActive()      const { return _tfliteReady;      }  // TFLite 활성화 여부
 
-  // 64샘플 윈도우 전체 분류 결과: FLOW_SLOW / FLOW_NORMAL / FLOW_FAST
-  int   getWindowResult()     const { return _windowResult; }
-  // 해당 결과의 신뢰도 (0.0 ~ 1.0)
-  float getWindowConfidence() const { return _windowConfidence; }
-  // 결과가 유효한가 (첫 번째 윈도우가 완성됐는가)
-  bool  isWindowFull()        const { return _hasResult; }
-  // 현재 윈도우에서 수집된 샘플 수 (0~63)
-  int   getSampleCount()      const { return _count; }
-  // 이상 감지 여부 — 윈도우 완성 직후 1회만 true, 이후 자동 클리어
+  // 이상 감지 플래그 — 윈도우 완성 직후 1회만 true 반환, 이후 자동 클리어
   bool detectAnomaly() {
     if (_alertPending) { _alertPending = false; return true; }
     return false;
   }
 
-  // 단일 샘플 상태 (매 측정마다 갱신)
-  int   getLastState()        const { return _lastState; }
-  bool  isTFLiteActive()      const { return _tfliteReady; }
-
-  // 결과를 한국어 문자열로
+  // 결과를 한국어 문자열로 반환
   const char* getResultLabel() const {
     if (!isWindowFull()) return "수집중";
     switch (_windowResult) {
-      case FLOW_FAST:   return "유속 빠름";
-      case FLOW_SLOW:   return "유속 느림";
-      default:          return "정상";
+      case FLOW_FAST: return "유속 빠름";
+      case FLOW_SLOW: return "유속 느림";
+      default:        return "정상";
     }
   }
 
@@ -178,10 +176,12 @@ public:
     memcpy(out, _image, sizeof(_image));
   }
 
+  // 전체 초기화
   void reset() {
     memset(_buf,   0, sizeof(_buf));
     memset(_image, 0, sizeof(_image));
-    _head = 0; _count = 0;
+    _head             = 0;
+    _count            = 0;
     _lastState        = FLOW_NORMAL;
     _windowResult     = FLOW_NORMAL;
     _windowConfidence = 0.0f;
@@ -204,6 +204,7 @@ private:
   alignas(16) uint8_t       _arena[TENSOR_ARENA_SZ];
   bool _tfliteReady, _useFallback;
 
+  // 1차원 버퍼 → 2차원 이미지 변환
   void buildImage() {
     for (int r = 0; r < CNN_DIM; r++)
       for (int c = 0; c < CNN_DIM; c++)
@@ -212,13 +213,10 @@ private:
 
   // 추론 실행 → _windowResult, _windowConfidence 갱신
   void runClassify() {
-    if (_tfliteReady) {
-      classifyCNN();
-    } else {
-      classifyFallback();
-    }
+    _tfliteReady ? classifyCNN() : classifyFallback();
   }
 
+  // TFLite 모델로 3클래스 분류
   void classifyCNN() {
 #ifdef CNN_MODEL_AVAILABLE
     TfLiteTensor *input = _interpreter->input(0);
@@ -227,12 +225,12 @@ private:
         input->data.f[r * CNN_DIM + c] = (float)_image[r][c];
 
     if (_interpreter->Invoke() != kTfLiteOk) {
-      Serial.println("[CNN] Invoke failed — fallback.");
+      Serial.println("[CNN] Invoke 실패 — Fallback으로 전환.");
       classifyFallback();
       return;
     }
 
-    // output: [P(slow), P(normal), P(fast)]
+    // 출력: [P(slow), P(normal), P(fast)]
     float pSlow   = _interpreter->output(0)->data.f[0];
     float pNormal = _interpreter->output(0)->data.f[1];
     float pFast   = _interpreter->output(0)->data.f[2];
@@ -250,7 +248,7 @@ private:
 #endif
   }
 
-  // Fallback: +1/-1 픽셀 비율로 판단
+  // Fallback: +1/-1 픽셀 비율로 판단 (모델 없을 때 사용)
   void classifyFallback() {
     int fast = 0, slow = 0;
     for (int r = 0; r < CNN_DIM; r++)
@@ -258,10 +256,11 @@ private:
         if (_image[r][c] == FLOW_FAST) fast++;
         if (_image[r][c] == FLOW_SLOW) slow++;
       }
+
     float ratioFast = (float)fast / CNN_WIN;
     float ratioSlow = (float)slow / CNN_WIN;
 
-    if (ratioFast >= _ratioThresh && ratioFast > ratioSlow) {
+    if      (ratioFast >= _ratioThresh && ratioFast > ratioSlow) {
       _windowResult     = FLOW_FAST;
       _windowConfidence = ratioFast;
     } else if (ratioSlow >= _ratioThresh && ratioSlow > ratioFast) {
