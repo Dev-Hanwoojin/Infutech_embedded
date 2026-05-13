@@ -374,6 +374,22 @@ void handleSerial() {
                   detector.getWindowConfidence() * 100.0f,
                   detector.isTFLiteActive() ? "ON" : "fallback",
                   detector.getSampleCount());
+  } else if (line.startsWith("tolerance ")) {
+    // 유속 허용 오차 비율 설정 (0.0~1.0)
+    // 예) tolerance 0.17  →  목표 60gtt 기준 ±17% = 50~70gtt 정상
+    float t = line.substring(10).toFloat();
+    if (t <= 0 || t >= 1.0f) {
+      Serial.println("[CMD] tolerance 범위: 0.05 ~ 0.50  예) tolerance 0.17");
+    } else {
+      detector.setTolerance(t);
+      float targetGtt = (iv.targetFlowRate > 0 && iv.dripFactor > 0)
+                        ? (iv.targetFlowRate / iv.dripFactor) * 60.0f : 0;
+      Serial.printf("[CMD] tolerance=±%.0f%%\n", t * 100.0f);
+      if (targetGtt > 0)
+        Serial.printf("[CMD] 현재 목표 %.0fgtt 기준 정상 범위: %.0f ~ %.0f gtt/min\n",
+                      targetGtt, targetGtt * (1.0f - t), targetGtt * (1.0f + t));
+    }
+
   } else if (line.startsWith("dropfactor ")) {
     // IV 세트 드립 팩터 교정 (g/gtt)
     // 예: 20gtt/mL 세트 → dropfactor 0.05
@@ -411,6 +427,7 @@ void handleSerial() {
   } else {
     Serial.println("[CMD] Commands:");
     Serial.println("  target <gtt/min>      유속 설정 및 모니터링 시작");
+    Serial.println("  tolerance <0.05~0.5>  허용 오차 비율 (기본 0.17 = ±17%)");
     Serial.println("  dropfactor <g/gtt>    드립 팩터 교정 (20gtt/mL=0.05, 15=0.0667, 10=0.1)");
     Serial.println("  finish <g>            종료 무게 설정");
     Serial.println("  tare                  영점 조정");
