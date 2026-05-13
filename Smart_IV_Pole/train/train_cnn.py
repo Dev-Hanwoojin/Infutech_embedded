@@ -1,0 +1,188 @@
+"""
+Smart IV Pole — CNN 학습 및 TFLite 변환 스크립트
+
+실행 방법:
+    pip install tensorflow numpy
+    python train_cnn.py
+
+출력:
+    ../cnn_model.h   ← Arduino 프로젝트에 복사됨 (자동)
+
+학습 데이터 구조:
+    입력  : 8×8×1 float32 이미지  (픽셀값 -1 / 0 / 1)
+    출력  : [정상 확률, 비정상 확률]
+
+    정상 이미지  : ±1이 드문드문 랜덤 분포 (< 20%)
+    비정상 이미지: ±1이 시간적으로 연속된 블록 (> 35%)
+                  → 유속 빠름(+1) 또는 느림(-1) 지속 구간
+"""
+
+import os
+import sys
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+
+# ── 재현성 ─────────────────────────────────────────────────────────
+np.random.seed(42)
+tf.random.set_seed(42)
+
+CNN_DIM   = 8
+WIN_SIZE  = CNN_DIM * CNN_DIM   # 64
+
+
+# ── 합성 데이터 생성 ───────────────────────────────────────────────
+
+def make_normal(n: int) -> np.ndarray:
+    """정상: ±1 픽셀이 랜덤하게 흩어져 있음 (밀도 < 18%)"""
+    imgs = np.zeros((n, WIN_SIZE), dtype=np.float32)
+    for i in range(n):
+        density = np.random.uniform(0.0, 0.18)
+        k = max(0, int(WIN_SIZE * density))
+        if k > 0:
+            pos = np.random.choice(WIN_SIZE, k, replace=False)
+            imgs[i, pos] = np.random.choice([-1.0, 1.0], size=k)
+    return imgs.reshape(n, CNN_DIM, CNN_DIM, 1)
+
+
+def make_fast(n: int) -> np.ndarray:
+    """유속 빠름: +1이 시간 축으로 연속된 블록"""
+    imgs = np.zeros((n, WIN_SIZE), dtype=np.float32)
+    for i in range(n):
+        run   = np.random.randint(23, 55)
+        start = np.random.randint(0, WIN_SIZE - run)
+        imgs[i, start:start + run] = 1.0
+        # 소량 노이즈
+        for p in np.random.choice(WIN_SIZE, 4, replace=False):
+            if imgs[i, p] == 0:
+                imgs[i, p] = float(np.random.choice([-1, 0, 1]))
+    return imgs.reshape(n, CNN_DIM, CNN_DIM, 1)
+
+
+def make_slow(n: int) -> np.ndarray:
+    """유속 느림: -1이 시간 축으로 연속된 블록"""
+    imgs = np.zeros((n, WIN_SIZE), dtype=np.float32)
+    for i in range(n):
+        run   = np.random.randint(23, 55)
+        start = np.random.randint(0, WIN_SIZE - run)
+        imgs[i, start:start + run] = -1.0
+        for p in np.random.choice(WIN_SIZE, 4, replace=False):
+            if imgs[i, p] == 0:
+                imgs[i, p] = float(np.random.choice([-1, 0, 1]))
+    return imgs.reshape(n, CNN_DIM, CNN_DIM, 1)
+
+
+# ── 데이터셋 구성 (3클래스) ────────────────────────────────────────
+# label: 0=SLOW  1=NORMAL  2=FAST  (cnn_detector.h 와 동일 순서)
+
+N_PER_CLASS = 8000
+X_slow   = make_slow(N_PER_CLASS)
+X_normal = make_normal(N_PER_CLASS)
+X_fast   = make_fast(N_PER_CLASS)
+
+X = np.concatenate([X_slow, X_normal, X_fast], axis=0)
+y = np.array([0]*N_PER_CLASS + [1]*N_PER_CLASS + [2]*N_PER_CLASS, dtype=np.int32)
+y_onehot = keras.utils.to_categorical(y, 3)
+
+idx = np.random.permutation(len(X))
+X, y_onehot = X[idx], y_onehot[idx]
+
+split = int(len(X) * 0.85)
+X_train, X_val = X[:split], X[split:]
+y_train, y_val = y_onehot[:split], y_onehot[split:]
+
+print(f"Train: {len(X_train)}  Val: {len(X_val)}")
+
+
+# ── 모델 정의 ──────────────────────────────────────────────────────
+# TFLite Micro ops 최소화: Conv2D, MaxPool2D, Reshape, FullyConnected, Softmax
+
+model = keras.Sequential([
+    keras.layers.Input(shape=(CNN_DIM, CNN_DIM, 1)),
+
+    keras.layers.Conv2D(8, (3, 3), padding='same', activation='relu'),
+    keras.layers.MaxPooling2D((2, 2)),          # → 4×4×8
+
+    keras.layers.Conv2D(4, (3, 3), padding='same', activation='relu'),
+    keras.layers.MaxPooling2D((2, 2)),          # → 2×2×4
+
+    keras.layers.Flatten(),                     # → 16
+    keras.layers.Dense(16, activation='relu'),
+    keras.layers.Dense(3,  activation='softmax'),   # slow / normal / fast
+], name='iv_cnn')
+
+model.summary()
+
+model.compile(
+    optimizer=keras.optimizers.Adam(1e-3),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+callbacks = [
+    keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True),
+    keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=4, verbose=1),
+]
+
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=80,
+    batch_size=64,
+    callbacks=callbacks,
+    verbose=1,
+)
+
+val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+print(f"\nVal accuracy: {val_acc*100:.1f}%  (target ≥ 90%)")
+if val_acc < 0.90:
+    print("[WARNING] Accuracy below 90% — consider more training data or epochs.")
+
+
+# ── TFLite float32 변환 ────────────────────────────────────────────
+
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+# Representative dataset for optional full-int8 quantization
+def rep_data():
+    for sample in X_val[:200]:
+        yield [sample.reshape(1, CNN_DIM, CNN_DIM, 1)]
+
+# float32 변환 (ESP32에서 안정적)
+tflite_model = converter.convert()
+
+model_size_kb = len(tflite_model) / 1024
+print(f"TFLite model size: {model_size_kb:.1f} KB")
+
+# ── cnn_model.h 생성 ───────────────────────────────────────────────
+
+OUT_PATH = os.path.join(os.path.dirname(__file__), '..', 'cnn_model.h')
+OUT_PATH = os.path.normpath(OUT_PATH)
+
+model_bytes = list(tflite_model)
+n = len(model_bytes)
+
+lines = []
+lines.append("// Auto-generated by train/train_cnn.py — DO NOT EDIT")
+lines.append(f"// Model size : {model_size_kb:.1f} KB  ({n} bytes)")
+lines.append(f"// Val accuracy: {val_acc*100:.1f}%")
+lines.append("#pragma once")
+lines.append("")
+lines.append("#define CNN_MODEL_AVAILABLE")
+lines.append("")
+lines.append("alignas(8) const unsigned char cnn_model_data[] = {")
+
+for i in range(0, n, 12):
+    chunk = model_bytes[i:i+12]
+    lines.append("  " + ", ".join(f"0x{b:02x}" for b in chunk) + ",")
+
+lines.append("};")
+lines.append(f"const unsigned int cnn_model_data_len = {n};")
+lines.append("")
+
+with open(OUT_PATH, 'w') as f:
+    f.write('\n'.join(lines))
+
+print(f"Written: {OUT_PATH}")
+print("Done. Recompile your Arduino sketch.")

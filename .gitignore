@@ -1,0 +1,34 @@
+# Arduino build artifacts
+build/
+*.elf
+*.bin
+*.hex
+*.map
+
+# IDE
+.vscode/
+.claude/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.env
+venv/
+
+# Logs / tmp
+*.log
+*.tmp
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Auto-generated model (regenerate with train/train_cnn.py)
+# Uncomment if you don't want to commit the model binary:
+# Smart_IV_Pole/cnn_model.h
+
+# Other
+Fuck/
