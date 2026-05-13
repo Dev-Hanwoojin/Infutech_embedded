@@ -41,6 +41,9 @@
 #define ADS_GAIN0 33
 #define ADS_GAIN1 32
 
+// ── 캘리브레이션 팩터 (Smart_IV_Pole.ino 와 동일한 값) ────────────
+#define CALIB_FACTOR_DEFAULT  1642.8623f
+
 #define PRINT_INTERVAL_MS  1000   // 실시간 출력 주기
 #define MIN_MEASURE_SEC    30     // 최소 측정 시간 (정확도 보장)
 
@@ -267,7 +270,9 @@ void setup() {
   Serial.println("\n=== 드립 팩터 측정 (Drip Factor Calibration) ===");
 
   scale.begin(128);
+  scale.setCalibFactor(CALIB_FACTOR_DEFAULT);
   Serial.println("[ADS] 초기화 완료. 열 안정화 대기 중...");
+  Serial.printf("[ADS] 캘리 팩터: %.4f\n", scale.getCalibFactor());
   for (int i = 5; i > 0; i--) {
     Serial.printf("  tare까지 %d초...\r", i);
     delay(1000);
