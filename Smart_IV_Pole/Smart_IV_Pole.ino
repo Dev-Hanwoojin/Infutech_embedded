@@ -55,6 +55,15 @@
 // calib_factor = (raw - tare) / known_grams
 #define CALIB_FACTOR_DEFAULT  1642.8623  // TODO: replace after calibration
 
+// ── Drip factor ───────────────────────────────────────────────────
+// 1 gtt 당 무게 (g). IV 세트 종류에 따라 다름:
+//   20 gtt/mL  →  0.0500 g/gtt  (기본, 일반 성인용)
+//   15 gtt/mL  →  0.0667 g/gtt
+//   10 gtt/mL  →  0.1000 g/gtt
+//   60 gtt/mL  →  0.0167 g/gtt  (소아용 마이크로드립)
+// serial 커맨드 "dropfactor <g>" 로 런타임에 교정 가능
+#define DRIP_FACTOR_DEFAULT  0.0500f
+
 // ── BLE provisioning ──────────────────────────────────────────────
 #define BLE_NAME  "IV_POLE_BLE"
 #define PROV_POP  "ivpole01"
@@ -70,11 +79,12 @@ CNNDetector  detector;
 #define WARMUP_SAMPLES  8
 
 struct IVState {
-  float targetFlowRate = 0;   // g/s
-  float finishWeight   = 0;   // g
-  float currentWeight  = 0;   // g
-  float prevWeight     = 0;   // g
-  float currentFlowRate= 0;   // g/s
+  float targetFlowRate = 0;                   // g/s
+  float finishWeight   = 0;                   // g
+  float currentWeight  = 0;                   // g
+  float prevWeight     = 0;                   // g
+  float currentFlowRate= 0;                   // g/s
+  float dripFactor     = DRIP_FACTOR_DEFAULT; // g/gtt — IV 세트에 맞게 교정
   bool  started        = false;
   bool  complete       = false;
   int   warmup         = 0;   // 남은 워밍업 횟수 (>0이면 flow 계산 안 함)
@@ -151,7 +161,7 @@ void onMqttMsg(char *topic, byte *payload, unsigned int len) {
     // App sends: { "targetFlowRate": 20, "finishWeight": 50 }  (gtt/min)
     if (doc.containsKey("targetFlowRate")) {
       float gttMin = doc["targetFlowRate"].as<float>();
-      iv.targetFlowRate = (gttMin / 60.0f) * 0.05f;  // gtt/min → g/s
+      iv.targetFlowRate = (gttMin / 60.0f) * iv.dripFactor;  // gtt/min → g/s
       detector.reset();
       Serial.printf("[IV] target=%.4f g/s (%.1f gtt/min)\n",
                     iv.targetFlowRate, gttMin);
@@ -329,7 +339,7 @@ void handleSerial() {
 
   if (line.startsWith("target ")) {
     float gttMin = line.substring(7).toFloat();
-    iv.targetFlowRate = (gttMin / 60.0f) * 0.05f;  // gtt/min → g/s (1gtt ≈ 0.05g)
+    iv.targetFlowRate = (gttMin / 60.0f) * iv.dripFactor;  // gtt/min → g/s
     detector.reset();
     loadCell.resetEma();
     iv.prevWeight = iv.currentWeight;
@@ -354,13 +364,32 @@ void handleSerial() {
     Serial.println("[CMD] Reset.");
 
   } else if (line == "status") {
-    Serial.printf("[STATUS] W:%.2fg  flow:%.4fg/s  target:%.4fg/s  "
-                  "결과:%s  신뢰도:%.0f%%  cnn:%s  샘플:%d/64\n",
-                  iv.currentWeight, iv.currentFlowRate, iv.targetFlowRate,
+    float targetGtt = (iv.dripFactor > 0)
+                      ? (iv.targetFlowRate / iv.dripFactor) * 60.0f : 0;
+    Serial.printf("[STATUS] W:%.2fg  flow:%.4fg/s  target:%.4fg/s (%.1fgtt/min)\n"
+                  "         dripFactor:%.5fg/gtt  결과:%s  신뢰도:%.0f%%  cnn:%s  샘플:%d/64\n",
+                  iv.currentWeight, iv.currentFlowRate, iv.targetFlowRate, targetGtt,
+                  iv.dripFactor,
                   detector.getResultLabel(),
                   detector.getWindowConfidence() * 100.0f,
                   detector.isTFLiteActive() ? "ON" : "fallback",
                   detector.getSampleCount());
+  } else if (line.startsWith("dropfactor ")) {
+    // IV 세트 드립 팩터 교정 (g/gtt)
+    // 예: 20gtt/mL 세트 → dropfactor 0.05
+    //     15gtt/mL 세트 → dropfactor 0.0667
+    //     10gtt/mL 세트 → dropfactor 0.1
+    // 또는 실측 교정: 1분간 측정된 무게감소(g) ÷ 설정 gtt/min 값
+    float df = line.substring(11).toFloat();
+    if (df <= 0) {
+      Serial.println("[CMD] dropfactor 값이 잘못됨 (예: dropfactor 0.05)");
+    } else {
+      iv.dripFactor = df;
+      // 이미 target이 설정돼 있으면 g/s 값 재계산 필요 — target 커맨드를 다시 입력하거나:
+      Serial.printf("[CMD] dripFactor=%.5f g/gtt\n", iv.dripFactor);
+      Serial.println("[CMD] ※ 변경 후 'target <gtt/min>' 다시 입력해야 g/s 값이 갱신됨");
+    }
+
   } else if (line.startsWith("alpha ")) {
     float a = line.substring(6).toFloat();
     a = constrain(a, 0.05f, 0.5f);
@@ -380,7 +409,16 @@ void handleSerial() {
     clearImageLog();
 
   } else {
-    Serial.println("[CMD] Commands: target <g/min> | finish <g> | tare | reset | status | alpha | image | savelog | dumplog | clearlog");
+    Serial.println("[CMD] Commands:");
+    Serial.println("  target <gtt/min>      유속 설정 및 모니터링 시작");
+    Serial.println("  dropfactor <g/gtt>    드립 팩터 교정 (20gtt/mL=0.05, 15=0.0667, 10=0.1)");
+    Serial.println("  finish <g>            종료 무게 설정");
+    Serial.println("  tare                  영점 조정");
+    Serial.println("  reset                 초기화");
+    Serial.println("  status                현재 상태 출력");
+    Serial.println("  alpha <0.05~0.5>      EMA 부드러움 조절");
+    Serial.println("  image                 현재 CNN 이미지 출력");
+    Serial.println("  savelog / dumplog / clearlog");
   }
 }
 
@@ -420,8 +458,11 @@ void loop() {
         return;
       }
 
-      // g/s: positive = weight decreasing (IV flowing)
-      iv.currentFlowRate = iv.prevWeight - iv.currentWeight;
+      // g/s: (무게 감소량) / (경과 시간)
+      // prevWeight - currentWeight = 측정 주기 동안 빠져나간 무게(g)
+      // ÷ (WEIGHT_MS/1000) → g/s 로 정규화
+      iv.currentFlowRate = (iv.prevWeight - iv.currentWeight)
+                           / (WEIGHT_MS / 1000.0f);
 
       // Feed CNN detector
       detector.addSample(iv.currentFlowRate, iv.targetFlowRate);
