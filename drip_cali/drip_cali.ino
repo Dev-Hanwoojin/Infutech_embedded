@@ -46,8 +46,24 @@
 
 #define PRINT_INTERVAL_MS  1000   // 실시간 출력 주기
 #define MIN_MEASURE_SEC    30     // 최소 측정 시간 (정확도 보장)
+#define STABLE_SAMPLES     10     // 시작/종료 무게 안정화 샘플 수
 
 ADS1232 scale(ADS_DOUT, ADS_SCLK, ADS_PDWN, ADS_GAIN0, ADS_GAIN1);
+
+// ── EMA 우회, raw 다중 평균으로 안정적인 무게 측정 ─────────────────
+// EMA는 alpha=0.15로 느리게 추종 → 시작/종료 스냅샷에 부적합
+// raw 여러 개 평균을 사용해 드리프트/진동 노이즈 억제
+float stableWeight(int n = STABLE_SAMPLES) {
+  Serial.printf("  [무게 측정중 %d샘플...", n);
+  long sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += scale.readRaw();
+    delay(80);
+  }
+  float w = (float)(sum / n - scale.getTareOffset()) / scale.getCalibFactor();
+  Serial.printf(" %.4f g]\n", w);
+  return w;
+}
 
 // ── 측정 상태 ────────────────────────────────────────────────────
 struct MeasureState {
@@ -113,7 +129,8 @@ void autoMeasure(float gttPerMin, int seconds) {
     delay(1000);
   }
 
-  float startW = scale.readWeight();
+  Serial.println("[AUTO] 시작 무게 측정 중...");
+  float startW = stableWeight();
   unsigned long startMs = millis();
   Serial.printf("[AUTO] 시작 무게: %.4f g\n", startW);
   Serial.println("[AUTO] 측정 중... (시리얼 입력으로 중단 불가)");
@@ -134,7 +151,8 @@ void autoMeasure(float gttPerMin, int seconds) {
   }
 
   unsigned long elapsedMs = millis() - startMs;
-  float endW = scale.readWeight();
+  Serial.println("[AUTO] 종료 무게 측정 중...");
+  float endW = stableWeight();
 
   meas.gttPerMin   = gttPerMin;
   meas.startWeight = startW;
@@ -171,7 +189,8 @@ void handleSerial() {
     if (rate <= 0) { Serial.println("[ERR] 유속 값이 잘못됨 (예: start 60)"); return; }
 
     meas.gttPerMin   = rate;
-    meas.startWeight = scale.readWeight();
+    Serial.println("[START] 시작 무게 측정 중...");
+    meas.startWeight = stableWeight();
     meas.startMs     = millis();
     meas.running     = true;
 
@@ -187,7 +206,8 @@ void handleSerial() {
     if (!meas.running) { Serial.println("[ERR] 측정 중이 아닙니다."); return; }
     meas.running = false;
     unsigned long elapsedMs = millis() - meas.startMs;
-    float endWeight = scale.readWeight();
+    Serial.println("[STOP] 종료 무게 측정 중...");
+    float endWeight = stableWeight();
     Serial.printf("[STOP] 종료 무게: %.4f g\n", endWeight);
     printResult(endWeight, elapsedMs);
 
