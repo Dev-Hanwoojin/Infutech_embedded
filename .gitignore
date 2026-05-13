@@ -27,8 +27,7 @@ venv/
 __MACOSX/
 
 # Auto-generated model (regenerate with train/train_cnn.py)
-# Uncomment if you don't want to commit the model binary:
-# Smart_IV_Pole/cnn_model.h
+Smart_IV_Pole/cnn_model.h
 
 # Other
 Fuck/
