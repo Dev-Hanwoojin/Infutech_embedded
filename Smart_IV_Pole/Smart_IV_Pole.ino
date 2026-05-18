@@ -2,13 +2,13 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiProv.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "esp_system.h"
 #include "ads1232.h"
 #include "cnn_detector.h"
+#include "ble_wifi_prov.h"   // 커스텀 BLE WiFi 프로비저닝 (Flutter 앱용)
 
 // ── 펌웨어 버전 ───────────────────────────────────────────────────
 #define FW_VERSION  "1.1.0"
@@ -89,6 +89,7 @@ ADS1232      loadCell(ADS_DOUT, ADS_SCLK, ADS_PDWN, ADS_GAIN0, ADS_GAIN1);
 WiFiClient   espClient;
 PubSubClient mqtt(espClient);
 CNNDetector  detector;
+BLEWiFiProv  bleProv;   // BLE 기반 WiFi 프로비저닝 (Flutter 앱)
 
 // ─────────────────────────────────────────────────────────────────
 // IV 상태 구조체
@@ -150,33 +151,6 @@ void buildTopics() {
   snprintf(T_CONFIG, sizeof(T_CONFIG), "iv_pole/%s/config", deviceId);
   snprintf(T_CMD,    sizeof(T_CMD),    "iv_pole/%s/cmd",    deviceId);
   snprintf(T_INFO,   sizeof(T_INFO),   "iv_pole/%s/info",   deviceId);
-}
-
-// ─────────────────────────────────────────────────────────────────
-// BLE 프로비저닝 이벤트 콜백
-// ─────────────────────────────────────────────────────────────────
-void onProvEvent(arduino_event_t *ev) {
-  switch (ev->event_id) {
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      // IP 출력은 setup()에서 처리
-      break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      Serial.println("[WiFi] 연결 끊김.");
-      break;
-    case ARDUINO_EVENT_PROV_START:
-      Serial.printf("[Prov] BLE 대기 중.  기기명: %s\n", bleName);
-      break;
-    case ARDUINO_EVENT_PROV_CRED_RECV:
-      Serial.println("[Prov] WiFi 자격증명 수신.");
-      break;
-    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
-      Serial.println("[Prov] WiFi 인증 완료.");
-      break;
-    case ARDUINO_EVENT_PROV_END:
-      Serial.println("[Prov] 프로비저닝 완료.");
-      break;
-    default: break;
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -395,9 +369,10 @@ void handleSerial() {
     iv = IVState{};  ivPhase = PHASE_TARE;  detector.reset();
     Serial.println("[DBG] 초기화 → 재영점.");
   } else if (line == "wifireset") {
-    // WiFi 자격증명 삭제 → 재부팅 후 BLE 프로비저닝 모드로 진입
+    // 저장된 WiFi 자격증명 삭제 → 재부팅 후 BLE 프로비저닝 모드 진입
     Serial.println("[DBG] WiFi 자격증명 삭제 후 재부팅...");
-    WiFi.disconnect(true, true);   // NVS의 SSID/PW 삭제
+    bleProv.clearStoredCredentials();
+    WiFi.disconnect(true, true);
     delay(500);
     ESP.restart();
   } else if (line == "status") {
@@ -454,89 +429,32 @@ void setup() {
   loadCell.setCalibFactor(CALIB_FACTOR_DEFAULT);
   Serial.printf("[ADS] CalibFactor=%.2f\n", loadCell.getCalibFactor());
 
-  // ── WiFi 연결 ────────────────────────────────────────────────────
+  // ── WiFi 연결 (커스텀 BLE 프로비저닝) ────────────────────────────
   //
-  // [정상 부팅]
-  //   NVS에 저장된 자격증명으로 직접 연결 시도.
-  //   연결 성공 시 BLE 프로비저닝을 켜지 않음 (불필요).
+  // 1) NVS에 저장된 자격증명으로 먼저 연결 시도 (최대 10초)
+  // 2) 실패 시 BLE GATT 서버 시작 → Flutter 앱에서 접속하여
+  //    WiFi 스캔 → SSID 선택 → 비번 입력 → 연결
+  // 3) 연결 성공 시 NVS 저장 → 다음 부팅부터 자동 연결
   //
-  // [첫 부팅 / 자격증명 없음 / 연결 실패]
-  //   BLE 프로비저닝 모드 시작 → 앱에서 기기 검색 가능.
-  //   연결 완료까지 대기 (타임아웃 없음).
-  //
-  // [BOOT 버튼(GPIO0) 3초 누른 채로 부팅]
-  //   NVS 자격증명 강제 삭제 → BLE 프로비저닝 모드 진입.
-  //   앱에서 새 SSID/PW 재설정 가능.
+  // BLE 프로토콜은 ble_wifi_prov.h 상단 주석 참조.
+  // Flutter 앱은 flutter_blue_plus 등 표준 BLE 라이브러리 사용.
 
-  #define BOOT_BTN_PIN  0
+  bool wifiOk = bleProv.tryStoredCredentials(10000);
 
-  // ── BOOT 버튼(GPIO0) 누름 감지 → 강제 재프로비저닝 플래그 ─────
-  // ※ WiFi/BLE 초기화 전에 처리하고 곧바로 핀모드 해제해야 PHY 충돌 없음
-  bool forceReprovision = false;
-  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
-  delay(10);
-  if (digitalRead(BOOT_BTN_PIN) == LOW) {
-    Serial.println("[WiFi] BOOT 버튼 감지 — 3초 동안 유지하면 강제 재프로비저닝...");
-    delay(3000);
-    if (digitalRead(BOOT_BTN_PIN) == LOW) {
-      forceReprovision = true;
-      Serial.println("[WiFi] 강제 재프로비저닝 모드.");
-    }
-  }
-  // BOOT 버튼 핀모드 해제 → PHY가 GPIO0 자유롭게 사용하도록
-  pinMode(BOOT_BTN_PIN, INPUT);
+  if (!wifiOk) {
+    // 저장된 자격증명 없거나 연결 실패 → BLE 프로비저닝 시작
+    Serial.println("[WiFi] BLE 프로비저닝 모드 시작.");
+    Serial.printf( "[WiFi] 폰 블루투스에서 '%s' 검색 → Flutter 앱으로 연결.\n", bleName);
 
-  WiFi.onEvent(onProvEvent);
-  WiFi.mode(WIFI_STA);
+    bleProv.begin(bleName);   // BLE 광고 시작
 
-  // ── 저장된 자격증명으로 먼저 연결 시도 (강제 모드 아닐 때만) ──
-  if (!forceReprovision) {
-    Serial.println("[WiFi] 저장된 자격증명으로 연결 시도...");
-    WiFi.begin();
-    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-      delay(500); Serial.print(".");
-    }
-    Serial.println();
-  }
-
-  // ── 연결 실패 or 강제 재프로비저닝 시 BLE 시작 ─────────────────
-  if (WiFi.status() != WL_CONNECTED || forceReprovision) {
-    Serial.println("[WiFi] 저장된 자격증명 없음 또는 연결 실패.");
-    Serial.printf( "[WiFi] BLE 프로비저닝 시작 — 기기명: %s\n", bleName);
-    Serial.println("[WiFi] 'ESP BLE Prov' 앱을 열고 기기를 검색하세요.");
-    Serial.println("[WiFi] PoP 코드: ivpole01");
-
-    // ★★ 핵심 ★★
-    // WiFiProv.beginProvision() 은 NVS의 자격증명이 남아있으면
-    // WiFi.disconnect() 로 SSID/PW 를 지워도 자체 provisioning manager
-    // 상태를 별도 NVS 키로 추적하기 때문에 BLE 광고를 안 켠다.
-    //
-    // 8번째 인자 reset_provisioned=true 로 호출하면 라이브러리 내부에서
-    // network_prov_mgr_reset_wifi_provisioning() 을 호출해 강제로
-    // "미프로비저닝" 상태로 만든 뒤 BLE 광고를 시작한다.
-    WiFiProv.beginProvision(
-      NETWORK_PROV_SCHEME_BLE,
-      NETWORK_PROV_SCHEME_HANDLER_FREE_BLE,
-      NETWORK_PROV_SECURITY_1,
-      "ivpole01",   // PoP (Proof of Possession) — 앱 페어링 확인 코드
-      bleName,      // BLE 기기명 = 기기 ID (앱 QR 스캔 매칭)
-      NULL,         // service_key (BLE는 사용 안 함)
-      NULL,         // uuid (자동 생성)
-      true          // ★ reset_provisioned = true → BLE 광고 강제 시작
-    );
-
-    // 프로비저닝 완료(WiFi 연결)까지 무한 대기
-    // → 완료 전까지는 수액 모니터링도 의미 없으므로 여기서 블로킹
+    // WiFi 연결 완료까지 대기 (loop()를 돌면서 BLE 콜백 처리)
     while (WiFi.status() != WL_CONNECTED) {
-      delay(500); Serial.print(".");
+      bleProv.loop();
+      delay(50);
     }
-    Serial.println();
+    Serial.printf("[WiFi] 프로비저닝 완료! IP: %s\n", WiFi.localIP().toString().c_str());
   }
-
-  if (WiFi.status() == WL_CONNECTED)
-    Serial.printf("[WiFi] 연결 완료. IP: %s\n", WiFi.localIP().toString().c_str());
-  else
-    Serial.println("[WiFi] 미연결 — 오프라인 모드.");
 
   // ── CNN 탐지기 초기화 ────────────────────────────────────────────
   if (!detector.begin())
