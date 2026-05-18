@@ -24,7 +24,9 @@
 #define ADS_GAIN1 32
 
 // ── MQTT 설정 ─────────────────────────────────────────────────────
-#define MQTT_BROKER   "192.168.1.100"   // TODO: 실제 브로커 IP/도메인으로 변경
+// 브로커 사용 시: 실제 IP/도메인 입력  (예: "192.168.1.100" 또는 "broker.example.com")
+// 사용 안 함:    빈 문자열 ""        → 시도 자체를 안 함 (시리얼 깔끔)
+#define MQTT_BROKER   ""
 #define MQTT_PORT     1883
 // #define MQTT_USER  "user"            // 브로커 인증 필요 시 주석 해제
 // #define MQTT_PASS  "pass"
@@ -122,6 +124,9 @@ unsigned long lastWeightMs = 0;
 unsigned long lastStatusMs = 0;
 unsigned long lastMqttMs   = 0;
 
+// MQTT 활성화 플래그 — MQTT_BROKER 가 빈 문자열이면 false (시도 자체 안 함)
+const bool mqttEnabled = (MQTT_BROKER[0] != '\0');
+
 // =================================================================
 // 기기 ID 생성 — ESP32 칩 고유 MAC으로 식별
 // =================================================================
@@ -207,6 +212,7 @@ void publishOnline() {
 // 브로커가 자동으로 T_INFO에 {"online":false} 를 발행해줌
 // ─────────────────────────────────────────────────────────────────
 bool connectMQTT() {
+  if (!mqttEnabled) return false;                // MQTT 비활성화
   if (mqtt.connected()) return true;
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -460,10 +466,14 @@ void setup() {
   if (!detector.begin())
     Serial.println("[CNN] Fallback 모드.");
 
-  // ── MQTT 설정 ────────────────────────────────────────────────────
-  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-  mqtt.setCallback(onMqttMsg);
-  connectMQTT();
+  // ── MQTT 설정 (활성화된 경우만) ──────────────────────────────────
+  if (mqttEnabled) {
+    mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+    mqtt.setCallback(onMqttMsg);
+    connectMQTT();
+  } else {
+    Serial.println("[MQTT] 비활성화 (MQTT_BROKER 미설정)");
+  }
 
   // ── 부팅 타이머 시작 → 2초 후 자동 영점 ──────────────────────────
   bootMs = millis();
@@ -484,12 +494,14 @@ void loop() {
   // WiFi 재연결 감시
   if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
 
-  // MQTT 연결 유지 및 재연결
-  if (!mqtt.connected() && now - lastMqttMs > MQTT_RETRY_MS) {
-    lastMqttMs = now;
-    connectMQTT();
+  // MQTT 연결 유지 및 재연결 (활성화된 경우만)
+  if (mqttEnabled) {
+    if (!mqtt.connected() && now - lastMqttMs > MQTT_RETRY_MS) {
+      lastMqttMs = now;
+      connectMQTT();
+    }
+    mqtt.loop();
   }
-  mqtt.loop();
 
   // =================================================================
   // 자동 부팅 절차 상태 머신
@@ -645,7 +657,7 @@ void loop() {
   }
 
   // ── MQTT 상태 발행 (5초 주기, 모니터링 중에만) ───────────────────
-  if (ivPhase == PHASE_MONITOR && now - lastStatusMs >= STATUS_MS) {
+  if (mqttEnabled && ivPhase == PHASE_MONITOR && now - lastStatusMs >= STATUS_MS) {
     lastStatusMs = now;
     publishStatus();
   }
