@@ -7,7 +7,6 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "esp_system.h"
-#include "esp_efuse.h"    // esp_efuse_mac_get_default()
 #include "ads1232.h"
 #include "cnn_detector.h"
 
@@ -126,12 +125,12 @@ unsigned long lastMqttMs   = 0;
 // 기기 ID 생성 — ESP32 칩 고유 MAC으로 식별
 // =================================================================
 void buildDeviceId() {
-  // ESP32 eFuse MAC 6바이트 구조:
-  //   byte[0~2] = OUI (Espressif 제조사 코드, 모든 기기 동일)
-  //   byte[3~5] = 기기별 고유값  →  getEfuseMac() uint64_t 기준 bit[47:24]
-  // ※ mac & 0xFFFFFF 는 OUI를 가져오므로 모든 기기가 같은 ID가 됨 → 잘못된 방법
+  // WiFi.macAddress(buf) : WiFi 연결 전에도 동작, 추가 헤더 불필요
+  // MAC 구조: [OUI 3바이트(Espressif 공통)] [기기 고유 3바이트]
+  //   mac[0~2] = OUI → 모든 ESP32 동일, ID로 쓰면 안 됨
+  //   mac[3~5] = 기기별 고유값 → 이걸 ID로 사용
   uint8_t mac[6];
-  esp_efuse_mac_get_default(mac);   // mac[0]=OUI첫번째 ... mac[5]=기기고유마지막
+  WiFi.macAddress(mac);
   snprintf(deviceId, sizeof(deviceId), "IVPOLE_%02X%02X%02X", mac[3], mac[4], mac[5]);
   snprintf(bleName,  sizeof(bleName),  "%s", deviceId);
 }
