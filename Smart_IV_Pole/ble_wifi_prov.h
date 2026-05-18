@@ -94,13 +94,15 @@ public:
 
     BLEService *service = server->createService(BLEPROV_SERVICE_UUID);
 
-    // 1) Scan characteristic
+    // 1) Scan characteristic — Write(스캔 트리거) + Notify(청크 push)
+    //    Read 대신 Notify 사용. 큰 JSON 을 20바이트 청크로 잘라 보냄 →
+    //    MTU 협상 실패해도 안전.
     _charScan = service->createCharacteristic(
       BLEPROV_CHAR_SCAN_UUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
     );
+    _charScan->addDescriptor(new BLE2902());
     _charScan->setCallbacks(new ScanCallbacks(this));
-    _charScan->setValue("[]");
 
     // 2) Credentials characteristic
     _charCred = service->createCharacteristic(
@@ -152,20 +154,35 @@ public:
     Serial.println("[BLEProv] ※ 안드로이드: 위치 서비스 ON + 앱 위치권한 허용 필요");
   }
 
-  // loop() 에서 주기적으로 호출 — WiFi 연결 상태 변화 감지
+  // loop() 에서 주기적으로 호출
   void loop() {
     // 비동기 WiFi 스캔 완료 체크
     if (_scanInProgress) {
       int16_t n = WiFi.scanComplete();
       if (n >= 0) {
         buildScanJson(n);
-        size_t len = strlen(_scanJson);
-        _charScan->setValue((uint8_t*)_scanJson, len);
         WiFi.scanDelete();
         _scanInProgress = false;
         setState(IDLE);
-        Serial.printf("[BLEProv] WiFi 스캔 완료: %d개, JSON %u bytes\n", n, (unsigned)len);
-        Serial.printf("[BLEProv] JSON 내용: %s\n", _scanJson);
+
+        size_t total = strlen(_scanJson);
+        Serial.printf("[BLEProv] WiFi 스캔 완료: %d개, JSON %u bytes — 청크 전송 시작\n",
+                      n, (unsigned)total);
+
+        // ★ 청크 분할 notify — MTU 협상 무관하게 안정적 전송
+        //   각 청크 20바이트 (기본 ATT MTU 23 - 헤더 3바이트 안전 마진)
+        const size_t CHUNK = 20;
+        for (size_t i = 0; i < total; i += CHUNK) {
+          size_t len = (i + CHUNK < total) ? CHUNK : (total - i);
+          _charScan->setValue((uint8_t*)(_scanJson + i), len);
+          _charScan->notify();
+          delay(30);   // 폰이 처리할 시간
+        }
+        // 끝 마커: 단일 '\n' (0x0A) 1바이트
+        _charScan->setValue((uint8_t*)"\n", 1);
+        _charScan->notify();
+        Serial.printf("[BLEProv] 청크 전송 완료 (%u 청크)\n",
+                      (unsigned)((total + CHUNK - 1) / CHUNK));
       }
     }
 
@@ -333,19 +350,7 @@ private:
       Serial.println("[BLEProv] WiFi 스캔 요청 수신 (write)");
       _p->startScan();
     }
-    void onRead(BLECharacteristic *c) override {
-      // ★ 매 read 요청마다 _scanJson 으로 setValue 강제 재호출.
-      //   일부 Bluedroid 버전에서 setValue 후 read 첫 응답이 1바이트만 가는
-      //   캐시 문제 회피.
-      size_t len = strlen(_p->_scanJson);
-      if (len == 0) {
-        c->setValue((uint8_t*)"[]", 2);
-        Serial.println("[BLEProv] read 요청 - 데이터 없음, [] 응답");
-      } else {
-        c->setValue((uint8_t*)_p->_scanJson, len);
-        Serial.printf("[BLEProv] read 요청 - %u bytes 응답\n", (unsigned)len);
-      }
-    }
+    // onRead 불필요 — 데이터는 notify 로만 전송
   private:
     BLEWiFiProv *_p;
   };
