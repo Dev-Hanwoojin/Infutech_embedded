@@ -77,6 +77,10 @@ public:
     Serial.printf("[BLEProv] BLE 초기화 중... 기기명: %s\n", _deviceName);
     BLEDevice::init(_deviceName);
 
+    // ★ MTU 늘리기 — 기본 23바이트로는 WiFi 목록 JSON이 잘림
+    //   517 요청 시 클라이언트가 MTU 협상하면 한 번에 큰 패킷 전송 가능
+    BLEDevice::setMTU(517);
+
     // GATT 서버 생성
     BLEServer *server = BLEDevice::createServer();
     server->setCallbacks(new ServerCallbacks(this));
