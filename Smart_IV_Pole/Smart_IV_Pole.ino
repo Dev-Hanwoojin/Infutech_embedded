@@ -437,24 +437,25 @@ void setup() {
 
   // ── WiFi 연결 (커스텀 BLE 프로비저닝) ────────────────────────────
   //
-  // 1) NVS에 저장된 자격증명으로 먼저 연결 시도 (최대 10초)
-  // 2) 실패 시 BLE GATT 서버 시작 → Flutter 앱에서 접속하여
-  //    WiFi 스캔 → SSID 선택 → 비번 입력 → 연결
-  // 3) 연결 성공 시 NVS 저장 → 다음 부팅부터 자동 연결
+  // 정책: ★ BLE는 항상 켜둠 ★
+  //   1) 부팅 시 저장된 자격증명으로 WiFi 자동 연결 시도 (최대 10초)
+  //   2) 성공/실패 무관하게 BLE GATT 서버 시작 → 언제든 앱에서 재설정 가능
+  //   3) WiFi 실패 시 연결될 때까지 대기 (앱에서 설정해야 메인 루프 진입)
+  //   4) WiFi 성공 시 바로 메인 루프 진입 (BLE 는 백그라운드 광고 계속)
   //
   // BLE 프로토콜은 ble_wifi_prov.h 상단 주석 참조.
   // Flutter 앱은 flutter_blue_plus 등 표준 BLE 라이브러리 사용.
 
   bool wifiOk = bleProv.tryStoredCredentials(10000);
 
+  // WiFi 성공 여부와 관계없이 BLE 항상 시작 (언제든 재프로비저닝 가능)
+  Serial.printf("[WiFi] BLE 프로비저닝 광고 시작. 기기명: %s\n", bleName);
+  Serial.println("[WiFi] 앱에서 언제든 WiFi 재설정 가능합니다.");
+  bleProv.begin(bleName);
+
   if (!wifiOk) {
-    // 저장된 자격증명 없거나 연결 실패 → BLE 프로비저닝 시작
-    Serial.println("[WiFi] BLE 프로비저닝 모드 시작.");
-    Serial.printf( "[WiFi] 폰 블루투스에서 '%s' 검색 → Flutter 앱으로 연결.\n", bleName);
-
-    bleProv.begin(bleName);   // BLE 광고 시작
-
-    // WiFi 연결 완료까지 대기 (loop()를 돌면서 BLE 콜백 처리)
+    // WiFi 자동 연결 실패 → 앱에서 설정할 때까지 메인 진입 대기
+    Serial.println("[WiFi] WiFi 미연결 — 앱에서 설정 대기 중...");
     while (WiFi.status() != WL_CONNECTED) {
       bleProv.loop();
       delay(50);
@@ -490,6 +491,7 @@ void loop() {
   unsigned long now = millis();
 
   handleSerial();
+  bleProv.loop();   // BLE 백그라운드 처리 (재프로비저닝 콜백 등)
 
   // WiFi 재연결 감시
   if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
