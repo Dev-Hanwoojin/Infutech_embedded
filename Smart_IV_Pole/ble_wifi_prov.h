@@ -172,17 +172,20 @@ public:
         // ★ 청크 분할 notify — MTU 협상 무관하게 안정적 전송
         //   각 청크 20바이트 (기본 ATT MTU 23 - 헤더 3바이트 안전 마진)
         const size_t CHUNK = 20;
+        size_t chunkCount = 0;
         for (size_t i = 0; i < total; i += CHUNK) {
           size_t len = (i + CHUNK < total) ? CHUNK : (total - i);
           _charScan->setValue((uint8_t*)(_scanJson + i), len);
           _charScan->notify();
-          delay(30);   // 폰이 처리할 시간
+          chunkCount++;
+          delay(50);   // 폰이 notify 처리할 시간 (30→50ms 늘림)
         }
         // 끝 마커: 단일 '\n' (0x0A) 1바이트
+        delay(50);
         _charScan->setValue((uint8_t*)"\n", 1);
         _charScan->notify();
-        Serial.printf("[BLEProv] 청크 전송 완료 (%u 청크)\n",
-                      (unsigned)((total + CHUNK - 1) / CHUNK));
+        Serial.printf("[BLEProv] 청크 전송 완료 (%u 청크, 총 %u bytes)\n",
+                      (unsigned)chunkCount, (unsigned)total);
       }
     }
 
@@ -253,7 +256,7 @@ private:
   String _pendingSsid;
   String _pendingPw;
 
-  char _scanJson[1024];
+  char _scanJson[2048];   // WiFi 목록 JSON 버퍼 — 한글 SSID 대비 넉넉히
 
   // ── 상태 변경 + Notify ──────────────────────────────────────────
   void setState(State newState) {
@@ -284,17 +287,28 @@ private:
     Serial.println("[BLEProv] WiFi 스캔 시작...");
   }
 
-  // 스캔 결과를 JSON으로 변환
+  // 스캔 결과를 JSON으로 변환 (안전장치 적용)
   void buildScanJson(int16_t n) {
-    StaticJsonDocument<1024> doc;
+    StaticJsonDocument<2048> doc;
     JsonArray arr = doc.to<JsonArray>();
-    for (int i = 0; i < n && i < 20; i++) {
+    // 최대 15개 + SSID 빈 항목 스킵 (JSON 크기 안정화)
+    int added = 0;
+    for (int i = 0; i < n && added < 15; i++) {
+      String ssid = WiFi.SSID(i);
+      if (ssid.length() == 0) continue;     // 숨겨진 SSID 스킵
+      if (ssid.length() > 32) ssid = ssid.substring(0, 32);
       JsonObject o = arr.createNestedObject();
-      o["ssid"] = WiFi.SSID(i);
+      o["ssid"] = ssid;
       o["rssi"] = WiFi.RSSI(i);
       o["enc"]  = (int)WiFi.encryptionType(i);
+      added++;
     }
-    serializeJson(doc, _scanJson, sizeof(_scanJson));
+    size_t n_written = serializeJson(doc, _scanJson, sizeof(_scanJson));
+    // 직렬화 실패 시 빈 배열로 fallback
+    if (n_written == 0 || n_written >= sizeof(_scanJson) - 1) {
+      strcpy(_scanJson, "[]");
+      Serial.println("[BLEProv] ⚠️ JSON 직렬화 실패 — 빈 배열로 응답");
+    }
   }
 
   // ── 받은 자격증명으로 WiFi 연결 ────────────────────────────────
