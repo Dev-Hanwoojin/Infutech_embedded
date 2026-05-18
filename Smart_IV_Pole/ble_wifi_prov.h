@@ -47,6 +47,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "esp_gatt_common_api.h"   // esp_ble_gatt_set_local_mtu()
 
 // ── UUID 정의 ─────────────────────────────────────────────────────
 #define BLEPROV_SERVICE_UUID       "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -58,6 +59,10 @@
 #define BLEPROV_NVS_NAMESPACE  "ble_wifi"
 
 class BLEWiFiProv {
+  // 콜백 클래스가 private 멤버 접근 가능하도록
+  friend class ScanCallbacks;
+  friend class CredCallbacks;
+
 public:
   enum State {
     IDLE,        // 대기 상태
@@ -77,9 +82,11 @@ public:
     Serial.printf("[BLEProv] BLE 초기화 중... 기기명: %s\n", _deviceName);
     BLEDevice::init(_deviceName);
 
-    // ★ MTU 늘리기 — 기본 23바이트로는 WiFi 목록 JSON이 잘림
-    //   517 요청 시 클라이언트가 MTU 협상하면 한 번에 큰 패킷 전송 가능
+    // ★ MTU 늘리기 — Bluedroid 는 BLEDevice::setMTU 만으로는 부족.
+    //   esp_ble_gatt_set_local_mtu() 로 직접 ATT MTU 강제 설정.
     BLEDevice::setMTU(517);
+    esp_err_t mtuRet = esp_ble_gatt_set_local_mtu(517);
+    Serial.printf("[BLEProv] esp_ble_gatt_set_local_mtu(517) = %d\n", mtuRet);
 
     // GATT 서버 생성
     BLEServer *server = BLEDevice::createServer();
@@ -327,9 +334,17 @@ private:
       _p->startScan();
     }
     void onRead(BLECharacteristic *c) override {
-      std::string v = c->getValue();
-      Serial.printf("[BLEProv] WiFi 목록 read 요청, 응답 %u bytes\n",
-                    (unsigned)v.length());
+      // ★ 매 read 요청마다 _scanJson 으로 setValue 강제 재호출.
+      //   일부 Bluedroid 버전에서 setValue 후 read 첫 응답이 1바이트만 가는
+      //   캐시 문제 회피.
+      size_t len = strlen(_p->_scanJson);
+      if (len == 0) {
+        c->setValue((uint8_t*)"[]", 2);
+        Serial.println("[BLEProv] read 요청 - 데이터 없음, [] 응답");
+      } else {
+        c->setValue((uint8_t*)_p->_scanJson, len);
+        Serial.printf("[BLEProv] read 요청 - %u bytes 응답\n", (unsigned)len);
+      }
     }
   private:
     BLEWiFiProv *_p;
