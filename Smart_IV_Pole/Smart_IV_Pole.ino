@@ -1,31 +1,4 @@
-/*
- * Smart IV Pole — 스마트 수액 폴 메인 스케치 (실무용)
- *
- * ── 기기 연결 흐름 ───────────────────────────────────────────────
- *   1. "ESP BLE Prov" 앱으로 BLE 접속 → WiFi 자격증명 전송
- *      BLE 기기명: IVPOLE_XXXXXX  (MAC 뒤 6자리, 기기마다 고유)
- *
- *   2. 앱이 기기 QR코드(또는 기기 ID) 스캔 → 백엔드 API 호출
- *      → 백엔드가 MQTT 브로커로 해당 기기 토픽에 메시지 전달
- *
- *   3. 이후 앱에서 목표 유속·종료 무게 설정 → 기기가 자동으로 수신
- *
- * ── 자동 부팅 절차 (조작 불필요) ────────────────────────────────
- *   전원 ON → 2초 대기 → 자동 영점 → 수액 감지(> 50g)
- *   → 60초 드립 팩터 교정 → EMA 안정화 → 모니터링
- *   (수액 제거 감지 시 자동 재영점·재시작)
- *
- * ── MQTT 토픽 구조 (/로 구분, 기기 ID별 격리) ──────────────────
- *   구독  iv_pole/<ID>/config  ← 목표 유속·종료 무게
- *   구독  iv_pole/<ID>/cmd     ← tare / reset
- *   발행  iv_pole/<ID>/status  → 무게·유속·예상 종료 (5초 주기)
- *   발행  iv_pole/<ID>/alert   → 이상 감지·주입 완료
- *   발행  iv_pole/<ID>/info    → 온·오프라인 상태 (retained)
- *
- * ── 필요 라이브러리 (Arduino Library Manager) ───────────────────
- *   PubSubClient  (Nick O'Leary)
- *   ArduinoJson   (Benoit Blanchon)
- */
+
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -33,7 +6,8 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
-#include "esp_system.h"   // ESP.getEfuseMac()
+#include "esp_system.h"
+#include "esp_efuse.h"    // esp_efuse_mac_get_default()
 #include "ads1232.h"
 #include "cnn_detector.h"
 
@@ -152,12 +126,14 @@ unsigned long lastMqttMs   = 0;
 // 기기 ID 생성 — ESP32 칩 고유 MAC으로 식별
 // =================================================================
 void buildDeviceId() {
-  // ESP32 eFuse MAC (각 기기 고유값, 변경 불가)
-  uint64_t mac = ESP.getEfuseMac();
-  // 뒤 3바이트(24비트)로 충돌 가능성 없는 단축 ID 생성
-  uint32_t suffix = (uint32_t)(mac & 0xFFFFFF);
-  snprintf(deviceId, sizeof(deviceId), "IVPOLE_%06X", suffix);
-  snprintf(bleName,  sizeof(bleName),  "%s",           deviceId);
+  // ESP32 eFuse MAC 6바이트 구조:
+  //   byte[0~2] = OUI (Espressif 제조사 코드, 모든 기기 동일)
+  //   byte[3~5] = 기기별 고유값  →  getEfuseMac() uint64_t 기준 bit[47:24]
+  // ※ mac & 0xFFFFFF 는 OUI를 가져오므로 모든 기기가 같은 ID가 됨 → 잘못된 방법
+  uint8_t mac[6];
+  esp_efuse_mac_get_default(mac);   // mac[0]=OUI첫번째 ... mac[5]=기기고유마지막
+  snprintf(deviceId, sizeof(deviceId), "IVPOLE_%02X%02X%02X", mac[3], mac[4], mac[5]);
+  snprintf(bleName,  sizeof(bleName),  "%s", deviceId);
 }
 
 // MQTT 토픽 문자열 빌드 (deviceId 확정 후 setup()에서 1회 호출)
