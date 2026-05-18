@@ -152,11 +152,13 @@ public:
       int16_t n = WiFi.scanComplete();
       if (n >= 0) {
         buildScanJson(n);
-        _charScan->setValue((uint8_t*)_scanJson, strlen(_scanJson));
+        size_t len = strlen(_scanJson);
+        _charScan->setValue((uint8_t*)_scanJson, len);
         WiFi.scanDelete();
         _scanInProgress = false;
         setState(IDLE);
-        Serial.printf("[BLEProv] WiFi 스캔 완료: %d개\n", n);
+        Serial.printf("[BLEProv] WiFi 스캔 완료: %d개, JSON %u bytes\n", n, (unsigned)len);
+        Serial.printf("[BLEProv] JSON 내용: %s\n", _scanJson);
       }
     }
 
@@ -321,7 +323,13 @@ private:
   public:
     ScanCallbacks(BLEWiFiProv *p) : _p(p) {}
     void onWrite(BLECharacteristic *c) override {
+      Serial.println("[BLEProv] WiFi 스캔 요청 수신 (write)");
       _p->startScan();
+    }
+    void onRead(BLECharacteristic *c) override {
+      std::string v = c->getValue();
+      Serial.printf("[BLEProv] WiFi 목록 read 요청, 응답 %u bytes\n",
+                    (unsigned)v.length());
     }
   private:
     BLEWiFiProv *_p;
