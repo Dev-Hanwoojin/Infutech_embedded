@@ -150,7 +150,7 @@ void buildTopics() {
 void onProvEvent(arduino_event_t *ev) {
   switch (ev->event_id) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.printf("[WiFi] 연결됨. IP: %s\n", WiFi.localIP().toString().c_str());
+      // IP 출력은 setup()에서 처리
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       Serial.println("[WiFi] 연결 끊김.");
@@ -386,6 +386,12 @@ void handleSerial() {
   } else if (line == "reset") {
     iv = IVState{};  ivPhase = PHASE_TARE;  detector.reset();
     Serial.println("[DBG] 초기화 → 재영점.");
+  } else if (line == "wifireset") {
+    // WiFi 자격증명 삭제 → 재부팅 후 BLE 프로비저닝 모드로 진입
+    Serial.println("[DBG] WiFi 자격증명 삭제 후 재부팅...");
+    WiFi.disconnect(true, true);   // NVS의 SSID/PW 삭제
+    delay(500);
+    ESP.restart();
   } else if (line == "status") {
     const char *ph[] = { "부팅대기","영점조정","수액대기","드립팩터교정","안정화","모니터링","완료" };
     Serial.printf("[STATUS] 단계:%s  W:%.2fg  유속:%.4f/%.4fg/s  dripF:%.5f\n"
@@ -440,24 +446,69 @@ void setup() {
   loadCell.setCalibFactor(CALIB_FACTOR_DEFAULT);
   Serial.printf("[ADS] CalibFactor=%.2f\n", loadCell.getCalibFactor());
 
-  // ── BLE WiFi 프로비저닝 ──────────────────────────────────────────
-  // NVS에 저장된 WiFi 자격증명 있으면 자동 연결,
-  // 없으면 앱에서 BLE로 SSID/PW 전송 필요
+  // ── WiFi 연결 ────────────────────────────────────────────────────
+  //
+  // [정상 부팅]
+  //   NVS에 저장된 자격증명으로 직접 연결 시도.
+  //   연결 성공 시 BLE 프로비저닝을 켜지 않음 (불필요).
+  //
+  // [첫 부팅 / 자격증명 없음 / 연결 실패]
+  //   BLE 프로비저닝 모드 시작 → 앱에서 기기 검색 가능.
+  //   연결 완료까지 대기 (타임아웃 없음).
+  //
+  // [BOOT 버튼(GPIO0) 3초 누른 채로 부팅]
+  //   NVS 자격증명 강제 삭제 → BLE 프로비저닝 모드 진입.
+  //   앱에서 새 SSID/PW 재설정 가능.
+
+  #define BOOT_BTN_PIN  0
   WiFi.onEvent(onProvEvent);
-  WiFiProv.beginProvision(
-    NETWORK_PROV_SCHEME_BLE,
-    NETWORK_PROV_SCHEME_HANDLER_FREE_BLE,
-    NETWORK_PROV_SECURITY_1,
-    "ivpole01",    // PoP (Proof of Possession) — 앱 페어링 시 요구
-    bleName        // BLE 기기명 = 기기 ID (앱이 QR 스캔 후 자동 매칭)
-  );
-  Serial.println("[WiFi] 프로비저닝 대기 중...");
+  WiFi.mode(WIFI_STA);
+
+  // ── BOOT 버튼 누름 감지 (GPIO0 LOW = 누름) ─────────────────────
+  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+  if (digitalRead(BOOT_BTN_PIN) == LOW) {
+    Serial.println("[WiFi] BOOT 버튼 감지 — 3초 동안 유지하면 WiFi 초기화...");
+    delay(3000);
+    if (digitalRead(BOOT_BTN_PIN) == LOW) {
+      WiFi.disconnect(true, true);   // NVS에서 SSID/PW 삭제
+      Serial.println("[WiFi] 자격증명 삭제 완료 → BLE 프로비저닝 모드로 진입.");
+    }
+  }
+
+  // ── 저장된 자격증명으로 먼저 연결 시도 ─────────────────────────
+  Serial.println("[WiFi] 저장된 자격증명으로 연결 시도...");
+  WiFi.begin();
   for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
     delay(500); Serial.print(".");
   }
   Serial.println();
-  if (WiFi.status() != WL_CONNECTED)
-    Serial.println("[WiFi] 미연결 — 오프라인 모드 (MQTT 비활성화).");
+
+  // ── 연결 실패 시 BLE 프로비저닝 시작 ───────────────────────────
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] 저장된 자격증명 없음 또는 연결 실패.");
+    Serial.printf( "[WiFi] BLE 프로비저닝 시작 — 기기명: %s\n", bleName);
+    Serial.println("[WiFi] 'ESP BLE Prov' 앱을 열고 기기를 검색하세요.");
+
+    WiFiProv.beginProvision(
+      NETWORK_PROV_SCHEME_BLE,
+      NETWORK_PROV_SCHEME_HANDLER_FREE_BLE,
+      NETWORK_PROV_SECURITY_1,
+      "ivpole01",   // PoP (Proof of Possession) — 앱 페어링 시 확인 코드
+      bleName       // BLE 기기명 = 기기 ID (앱이 QR 스캔 후 자동 매칭)
+    );
+
+    // 프로비저닝 완료(WiFi 연결)까지 무한 대기
+    // → 완료 전까지는 수액 모니터링도 의미 없으므로 여기서 블로킹
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500); Serial.print(".");
+    }
+    Serial.println();
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.printf("[WiFi] 연결 완료. IP: %s\n", WiFi.localIP().toString().c_str());
+  else
+    Serial.println("[WiFi] 미연결 — 오프라인 모드.");
 
   // ── CNN 탐지기 초기화 ────────────────────────────────────────────
   if (!detector.begin())
