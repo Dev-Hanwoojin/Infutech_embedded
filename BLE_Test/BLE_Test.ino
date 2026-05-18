@@ -73,10 +73,21 @@ void setup() {
 
   Serial.println("[BLE] 3/4 광고 설정 중...");
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
+
+  // 광고 패킷에 이름 명시적 포함 (폰 호환성↑)
+  BLEAdvertisementData advData;
+  advData.setFlags(0x06);
+  advData.setName(devName);
+  advData.setCompleteServices(BLEUUID(SERVICE_UUID));
+  pAdvertising->setAdvertisementData(advData);
+
+  BLEAdvertisementData scanRsp;
+  scanRsp.setName(devName);
+  pAdvertising->setScanResponseData(scanRsp);
+
   pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);   // iPhone 호환성
-  pAdvertising->setMinPreferred(0x12);
+  pAdvertising->setMinInterval(0xA0);  // 100ms
+  pAdvertising->setMaxInterval(0xF0);  // 150ms
   Serial.println("[BLE]      OK.");
 
   Serial.println("[BLE] 4/4 광고 시작!");

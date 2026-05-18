@@ -108,15 +108,37 @@ public:
 
     service->start();
 
-    // 광고 시작
+    // ── 광고 패킷 구성 ──────────────────────────────────────────
+    // 폰(특히 안드로이드)에서 잘 잡히게 하려면:
+    //  1) 광고 패킷에 이름을 명시적으로 포함 (scan response 의존 금지)
+    //  2) 광고 인터벌을 짧게 (빠른 발견)
+    //  3) BLE_GAP_CONN_MODE_UND (일반 발견 가능) + Connectable 모드
     BLEAdvertising *adv = BLEDevice::getAdvertising();
-    adv->addServiceUUID(BLEPROV_SERVICE_UUID);
+
+    // 광고 데이터: 이름 + Flags + 서비스 UUID
+    BLEAdvertisementData advData;
+    advData.setFlags(0x06);   // LE General Discoverable + BR/EDR Not Supported
+    advData.setName(_deviceName);
+    advData.setCompleteServices(BLEUUID(BLEPROV_SERVICE_UUID));
+    adv->setAdvertisementData(advData);
+
+    // 스캔 응답에도 이름 포함 (active scan 호환성)
+    BLEAdvertisementData scanRsp;
+    scanRsp.setName(_deviceName);
+    adv->setScanResponseData(scanRsp);
+
     adv->setScanResponse(true);
-    adv->setMinPreferred(0x06);
-    adv->setMinPreferred(0x12);
+
+    // 광고 인터벌: 짧게 → 폰이 빨리 발견 (단위 0.625ms)
+    //   100ms ~ 150ms 권장 (전력 vs 발견 속도 균형)
+    adv->setMinInterval(0xA0);   // 160 * 0.625 = 100ms
+    adv->setMaxInterval(0xF0);   // 240 * 0.625 = 150ms
+
     BLEDevice::startAdvertising();
 
-    Serial.printf("[BLEProv] BLE 광고 시작 — 일반 폰 블루투스 스캔 가능\n");
+    Serial.printf("[BLEProv] BLE 광고 시작 (인터벌 100~150ms)\n");
+    Serial.printf("[BLEProv] 광고 이름: %s\n", _deviceName);
+    Serial.println("[BLEProv] ※ 안드로이드: 위치 서비스 ON + 앱 위치권한 허용 필요");
   }
 
   // loop() 에서 주기적으로 호출 — WiFi 연결 상태 변화 감지
