@@ -485,6 +485,13 @@ void setup() {
 
   // ── 연결 실패 시 BLE 프로비저닝 시작 ───────────────────────────
   if (WiFi.status() != WL_CONNECTED) {
+    // ★ 핵심: WiFiProv.beginProvision()은 NVS에 자격증명이 남아있으면
+    //   연결 실패 상황에서도 BLE를 켜지 않고 WiFi 재시도만 한다.
+    //   따라서 beginProvision() 전에 NVS 자격증명을 반드시 지워야
+    //   BLE 광고가 시작된다.
+    WiFi.disconnect(false, true);   // NVS에서 SSID/PW 삭제 (WiFi off 없이)
+    delay(200);                     // NVS 쓰기 완료 대기
+
     Serial.println("[WiFi] 저장된 자격증명 없음 또는 연결 실패.");
     Serial.printf( "[WiFi] BLE 프로비저닝 시작 — 기기명: %s\n", bleName);
     Serial.println("[WiFi] 'ESP BLE Prov' 앱을 열고 기기를 검색하세요.");
