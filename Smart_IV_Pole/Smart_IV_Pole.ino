@@ -125,12 +125,20 @@ unsigned long lastMqttMs   = 0;
 // 기기 ID 생성 — ESP32 칩 고유 MAC으로 식별
 // =================================================================
 void buildDeviceId() {
-  // WiFi.macAddress(buf) : WiFi 연결 전에도 동작, 추가 헤더 불필요
-  // MAC 구조: [OUI 3바이트(Espressif 공통)] [기기 고유 3바이트]
-  //   mac[0~2] = OUI → 모든 ESP32 동일, ID로 쓰면 안 됨
-  //   mac[3~5] = 기기별 고유값 → 이걸 ID로 사용
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
+  // ★ WiFi.macAddress() 는 WiFi 스택 초기화 후에만 동작 → setup() 초반엔 0 반환.
+  //   ESP.getEfuseMac() 은 eFuse에서 직접 읽으므로 WiFi 초기화 무관.
+  //
+  // ESP.getEfuseMac() 반환값(uint64_t) 바이트 배치:
+  //   bit[ 7: 0] = mac[0]  (OUI 1바이트)
+  //   bit[15: 8] = mac[1]  (OUI 2바이트)
+  //   bit[23:16] = mac[2]  (OUI 3바이트)
+  //   bit[31:24] = mac[3]  ← 기기 고유값 시작
+  //   bit[39:32] = mac[4]
+  //   bit[47:40] = mac[5]  ← 기기 고유값 끝
+  uint64_t chipid = ESP.getEfuseMac();
+  uint8_t  mac[6];
+  for (int i = 0; i < 6; i++) mac[i] = (chipid >> (8 * i)) & 0xFF;
+
   snprintf(deviceId, sizeof(deviceId), "IVPOLE_%02X%02X%02X", mac[3], mac[4], mac[5]);
   snprintf(bleName,  sizeof(bleName),  "%s", deviceId);
 }
@@ -461,12 +469,12 @@ void setup() {
   //   앱에서 새 SSID/PW 재설정 가능.
 
   #define BOOT_BTN_PIN  0
-  WiFi.onEvent(onProvEvent);
-  WiFi.mode(WIFI_STA);
 
   // ── BOOT 버튼(GPIO0) 누름 감지 → 강제 재프로비저닝 플래그 ─────
+  // ※ WiFi/BLE 초기화 전에 처리하고 곧바로 핀모드 해제해야 PHY 충돌 없음
   bool forceReprovision = false;
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+  delay(10);
   if (digitalRead(BOOT_BTN_PIN) == LOW) {
     Serial.println("[WiFi] BOOT 버튼 감지 — 3초 동안 유지하면 강제 재프로비저닝...");
     delay(3000);
@@ -475,6 +483,11 @@ void setup() {
       Serial.println("[WiFi] 강제 재프로비저닝 모드.");
     }
   }
+  // BOOT 버튼 핀모드 해제 → PHY가 GPIO0 자유롭게 사용하도록
+  pinMode(BOOT_BTN_PIN, INPUT);
+
+  WiFi.onEvent(onProvEvent);
+  WiFi.mode(WIFI_STA);
 
   // ── 저장된 자격증명으로 먼저 연결 시도 (강제 모드 아닐 때만) ──
   if (!forceReprovision) {
