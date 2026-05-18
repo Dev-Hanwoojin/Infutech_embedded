@@ -44,6 +44,11 @@
 #define WEIGHT_HANG_G    50.0f   // 수액 감지: 이 이상이면 수액 걸린 것으로 판단
 #define WEIGHT_REMOVE_G  15.0f   // 수액 제거: 이 미만이면 수액 없는 것으로 판단
 
+// ── 수액 안정화 (흔들림 잡기) ────────────────────────────────────
+#define STABILIZE_WINDOW    5       // 안정화 판정에 사용할 최근 측정 샘플 수
+#define STABILIZE_RANGE_G   0.5f    // 윈도우 내 최대-최소 < 이 값이면 안정 판정
+#define STABILIZE_TIMEOUT_MS  30000UL  // 30초 안에 안정 안 되면 강제 교정 진입
+
 // ── 기본 목표 유속 ────────────────────────────────────────────────
 // 앱에서 변경 전까지 사용하는 기본값 (성인용 20gtt/mL 세트)
 #define DEFAULT_TARGET_GTT  60.0f   // gtt/min
@@ -75,13 +80,14 @@ char T_INFO[48];     // iv_pole/<ID>/info  (온·오프라인 retained)
 // 부팅 절차 단계 정의
 // =================================================================
 enum IVPhase {
-  PHASE_BOOT,     // 전원 ON — 2초 대기 중
-  PHASE_TARE,     // 자동 영점 조정 중
-  PHASE_WAIT,     // 수액 감지 대기
-  PHASE_CALIB,    // 드립 팩터 교정 중 (60초)
-  PHASE_WARMUP,   // EMA 안정화 대기 (8샘플)
-  PHASE_MONITOR,  // 주입 모니터링 중
-  PHASE_DONE      // 주입 완료
+  PHASE_BOOT,        // 전원 ON — 2초 대기 중
+  PHASE_TARE,        // 자동 영점 조정 중
+  PHASE_WAIT,        // 수액 감지 대기
+  PHASE_STABILIZE,   // 수액 흔들림 잡힐 때까지 대기 (교정 직전)
+  PHASE_CALIB,       // 드립 팩터 교정 중 (60초)
+  PHASE_WARMUP,      // EMA 안정화 대기 (8샘플)
+  PHASE_MONITOR,     // 주입 모니터링 중
+  PHASE_DONE         // 주입 완료
 };
 
 // ─────────────────────────────────────────────────────────────────
@@ -116,6 +122,12 @@ float         calibTargetGtt   = DEFAULT_TARGET_GTT;
 float         calibWeightStart = 0;
 unsigned long calibStartMs     = 0;
 unsigned long bootMs           = 0;
+
+// 안정화 단계 — 최근 N개 측정값의 변동 추적
+float         stabilizeBuf[STABILIZE_WINDOW] = {0};
+int           stabilizeIdx     = 0;
+int           stabilizeCount   = 0;
+unsigned long stabilizeStartMs = 0;
 
 // ─────────────────────────────────────────────────────────────────
 // 타이밍 변수
@@ -382,7 +394,7 @@ void handleSerial() {
     delay(500);
     ESP.restart();
   } else if (line == "status") {
-    const char *ph[] = { "부팅대기","영점조정","수액대기","드립팩터교정","안정화","모니터링","완료" };
+    const char *ph[] = { "부팅대기","영점조정","수액대기","흔들림안정화","드립팩터교정","EMA안정화","모니터링","완료" };
     Serial.printf("[STATUS] 단계:%s  W:%.2fg  유속:%.4f/%.4fg/s  dripF:%.5f\n"
                   "         결과:%s  신뢰도:%.0f%%  CNN:%s  샘플:%d/%d\n",
                   ph[ivPhase], iv.currentWeight,
@@ -534,12 +546,65 @@ void loop() {
     iv.currentWeight = w;
 
     if (w > WEIGHT_HANG_G) {
-      Serial.printf("[AUTO] 수액 감지 (%.1fg) — 드립 팩터 교정 시작\n", w);
-      Serial.printf("[AUTO] 목표: %.0f gtt/min | 교정 시간: %lu초\n",
-                    calibTargetGtt, CALIB_DURATION_MS / 1000UL);
-      calibWeightStart = loadCell.stableRead(10);
-      calibStartMs     = millis();
-      ivPhase          = PHASE_CALIB;
+      Serial.printf("[AUTO] 수액 감지 (%.1fg) — 흔들림 안정화 대기 시작\n", w);
+      // 안정화 버퍼 초기화
+      for (int i = 0; i < STABILIZE_WINDOW; i++) stabilizeBuf[i] = 0;
+      stabilizeIdx     = 0;
+      stabilizeCount   = 0;
+      stabilizeStartMs = millis();
+      ivPhase          = PHASE_STABILIZE;
+    }
+    return;
+  }
+
+  // ── 3-1단계: 흔들림 안정화 대기 ──────────────────────────────────
+  // 매 1초 측정값을 ring buffer 에 저장, 최근 N개 max-min < 임계값이면 안정.
+  // 30초 초과 시 강제로 교정 진입 (계속 흔들리면 마냥 기다릴 순 없음).
+  if (ivPhase == PHASE_STABILIZE && now - lastWeightMs >= WEIGHT_MS) {
+    lastWeightMs = now;
+    float w = loadCell.readWeight();
+    iv.currentWeight = w;
+
+    // 수액팩이 빠졌으면 다시 대기
+    if (w < WEIGHT_REMOVE_G) {
+      Serial.println("[AUTO] 안정화 중 수액 제거 감지 — 다시 대기.");
+      ivPhase = PHASE_WAIT;
+      return;
+    }
+
+    // ring buffer 에 저장
+    stabilizeBuf[stabilizeIdx] = w;
+    stabilizeIdx = (stabilizeIdx + 1) % STABILIZE_WINDOW;
+    if (stabilizeCount < STABILIZE_WINDOW) stabilizeCount++;
+
+    // 윈도우 가득 차야 판정
+    bool forceContinue = (now - stabilizeStartMs >= STABILIZE_TIMEOUT_MS);
+    if (stabilizeCount >= STABILIZE_WINDOW) {
+      // 최대-최소 차 계산
+      float mn = stabilizeBuf[0], mx = stabilizeBuf[0];
+      for (int i = 1; i < STABILIZE_WINDOW; i++) {
+        if (stabilizeBuf[i] < mn) mn = stabilizeBuf[i];
+        if (stabilizeBuf[i] > mx) mx = stabilizeBuf[i];
+      }
+      float range = mx - mn;
+      Serial.printf("[AUTO] 안정화 중... W:%.2fg  변동:%.2fg (기준 <%.2fg)\n",
+                    w, range, STABILIZE_RANGE_G);
+
+      if (range < STABILIZE_RANGE_G || forceContinue) {
+        if (forceContinue)
+          Serial.println("[AUTO] ⚠️ 안정화 시간 초과 — 강제로 교정 진입");
+        else
+          Serial.println("[AUTO] ✓ 안정화 완료 — 드립 팩터 교정 시작");
+
+        Serial.printf("[AUTO] 목표: %.0f gtt/min | 교정 시간: %lu초\n",
+                      calibTargetGtt, CALIB_DURATION_MS / 1000UL);
+        calibWeightStart = loadCell.stableRead(10);
+        calibStartMs     = millis();
+        ivPhase          = PHASE_CALIB;
+      }
+    } else {
+      Serial.printf("[AUTO] 안정화 샘플 수집 중... W:%.2fg (%d/%d)\n",
+                    w, stabilizeCount, STABILIZE_WINDOW);
     }
     return;
   }
@@ -574,9 +639,10 @@ void loop() {
   }
 
   // =================================================================
-  // 무게 측정 주기 (1초)
+  // 무게 측정 주기 (1초) — WAIT/STABILIZE 단계는 위에서 따로 처리
   // =================================================================
-  if (ivPhase != PHASE_WAIT && now - lastWeightMs >= WEIGHT_MS) {
+  if (ivPhase != PHASE_WAIT && ivPhase != PHASE_STABILIZE
+      && now - lastWeightMs >= WEIGHT_MS) {
     lastWeightMs = now;
 
     iv.prevWeight    = iv.currentWeight;
