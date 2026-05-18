@@ -464,44 +464,52 @@ void setup() {
   WiFi.onEvent(onProvEvent);
   WiFi.mode(WIFI_STA);
 
-  // ── BOOT 버튼 누름 감지 (GPIO0 LOW = 누름) ─────────────────────
+  // ── BOOT 버튼(GPIO0) 누름 감지 → 강제 재프로비저닝 플래그 ─────
+  bool forceReprovision = false;
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
   if (digitalRead(BOOT_BTN_PIN) == LOW) {
-    Serial.println("[WiFi] BOOT 버튼 감지 — 3초 동안 유지하면 WiFi 초기화...");
+    Serial.println("[WiFi] BOOT 버튼 감지 — 3초 동안 유지하면 강제 재프로비저닝...");
     delay(3000);
     if (digitalRead(BOOT_BTN_PIN) == LOW) {
-      WiFi.disconnect(true, true);   // NVS에서 SSID/PW 삭제
-      Serial.println("[WiFi] 자격증명 삭제 완료 → BLE 프로비저닝 모드로 진입.");
+      forceReprovision = true;
+      Serial.println("[WiFi] 강제 재프로비저닝 모드.");
     }
   }
 
-  // ── 저장된 자격증명으로 먼저 연결 시도 ─────────────────────────
-  Serial.println("[WiFi] 저장된 자격증명으로 연결 시도...");
-  WiFi.begin();
-  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-    delay(500); Serial.print(".");
+  // ── 저장된 자격증명으로 먼저 연결 시도 (강제 모드 아닐 때만) ──
+  if (!forceReprovision) {
+    Serial.println("[WiFi] 저장된 자격증명으로 연결 시도...");
+    WiFi.begin();
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+      delay(500); Serial.print(".");
+    }
+    Serial.println();
   }
-  Serial.println();
 
-  // ── 연결 실패 시 BLE 프로비저닝 시작 ───────────────────────────
-  if (WiFi.status() != WL_CONNECTED) {
-    // ★ 핵심: WiFiProv.beginProvision()은 NVS에 자격증명이 남아있으면
-    //   연결 실패 상황에서도 BLE를 켜지 않고 WiFi 재시도만 한다.
-    //   따라서 beginProvision() 전에 NVS 자격증명을 반드시 지워야
-    //   BLE 광고가 시작된다.
-    WiFi.disconnect(false, true);   // NVS에서 SSID/PW 삭제 (WiFi off 없이)
-    delay(200);                     // NVS 쓰기 완료 대기
-
+  // ── 연결 실패 or 강제 재프로비저닝 시 BLE 시작 ─────────────────
+  if (WiFi.status() != WL_CONNECTED || forceReprovision) {
     Serial.println("[WiFi] 저장된 자격증명 없음 또는 연결 실패.");
     Serial.printf( "[WiFi] BLE 프로비저닝 시작 — 기기명: %s\n", bleName);
     Serial.println("[WiFi] 'ESP BLE Prov' 앱을 열고 기기를 검색하세요.");
+    Serial.println("[WiFi] PoP 코드: ivpole01");
 
+    // ★★ 핵심 ★★
+    // WiFiProv.beginProvision() 은 NVS의 자격증명이 남아있으면
+    // WiFi.disconnect() 로 SSID/PW 를 지워도 자체 provisioning manager
+    // 상태를 별도 NVS 키로 추적하기 때문에 BLE 광고를 안 켠다.
+    //
+    // 8번째 인자 reset_provisioned=true 로 호출하면 라이브러리 내부에서
+    // network_prov_mgr_reset_wifi_provisioning() 을 호출해 강제로
+    // "미프로비저닝" 상태로 만든 뒤 BLE 광고를 시작한다.
     WiFiProv.beginProvision(
       NETWORK_PROV_SCHEME_BLE,
       NETWORK_PROV_SCHEME_HANDLER_FREE_BLE,
       NETWORK_PROV_SECURITY_1,
-      "ivpole01",   // PoP (Proof of Possession) — 앱 페어링 시 확인 코드
-      bleName       // BLE 기기명 = 기기 ID (앱이 QR 스캔 후 자동 매칭)
+      "ivpole01",   // PoP (Proof of Possession) — 앱 페어링 확인 코드
+      bleName,      // BLE 기기명 = 기기 ID (앱 QR 스캔 매칭)
+      NULL,         // service_key (BLE는 사용 안 함)
+      NULL,         // uuid (자동 생성)
+      true          // ★ reset_provisioned = true → BLE 광고 강제 시작
     );
 
     // 프로비저닝 완료(WiFi 연결)까지 무한 대기
