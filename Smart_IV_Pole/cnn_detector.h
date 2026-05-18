@@ -163,12 +163,23 @@ public:
   }
 
   // 결과를 한국어 문자열로 반환
+  // 빠름/느림 구분 없이 통합 "수액 이상 발생" 표시 (임상 단순화)
   const char* getResultLabel() const {
     if (!isWindowFull()) return "수집중";
     switch (_windowResult) {
-      case FLOW_FAST: return "유속 빠름";
-      case FLOW_SLOW: return "유속 느림";
+      case FLOW_FAST:
+      case FLOW_SLOW: return "수액 이상 발생";
       default:        return "정상";
+    }
+  }
+
+  // 디버그용 — 내부 빠름/느림 구분 (필요 시 사용)
+  const char* getResultDetail() const {
+    if (!isWindowFull()) return "collecting";
+    switch (_windowResult) {
+      case FLOW_FAST: return "fast";
+      case FLOW_SLOW: return "slow";
+      default:        return "normal";
     }
   }
 

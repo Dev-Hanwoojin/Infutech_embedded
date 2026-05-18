@@ -175,18 +175,21 @@ void buildTopics() {
 // ─────────────────────────────────────────────────────────────────
 
 // 이상 감지 알림 발행
-void publishAlert(const char *type, float measuredFlowRate) {
-  StaticJsonDocument<160> doc;
-  doc["type"]         = type;
+// MQTT 에는 빠름/느림 정보(detail)도 포함시켜 백엔드에서 필요 시 사용
+// 시리얼/사용자 표시는 통합 "수액 이상 발생"
+void publishAlert(float measuredFlowRate) {
+  StaticJsonDocument<192> doc;
+  doc["type"]         = "IV_ANOMALY";                    // 통합 알림 타입
+  doc["detail"]       = detector.getResultDetail();      // "fast" / "slow" (참고용)
   doc["flowMeasured"] = measuredFlowRate;
   doc["flowTarget"]   = iv.targetFlowRate;
   doc["confidence"]   = detector.getWindowConfidence();
   doc["ts"]           = millis();
-  char buf[160];
+  char buf[192];
   serializeJson(doc, buf);
-  mqtt.publish(T_ALERT, buf, true);
-  Serial.printf("[ALERT] %s  신뢰도:%.0f%%\n",
-                type, detector.getWindowConfidence() * 100.0f);
+  if (mqttEnabled) mqtt.publish(T_ALERT, buf, true);
+  Serial.printf("[ALERT] ⚠️ 수액 이상 발생  신뢰도:%.0f%%\n",
+                detector.getWindowConfidence() * 100.0f);
 }
 
 // 현재 상태 발행 (5초 주기)
@@ -681,10 +684,9 @@ void loop() {
       detector.addSample(iv.currentFlowRate, iv.targetFlowRate);
 
       // 이상 감지 — 윈도우 완성 직후 1회만 발동
+      // 빠름/느림 구분 없이 통합 "수액 이상 발생" 알림
       if (detector.detectAnomaly()) {
-        const char *alert = (detector.getWindowResult() == FLOW_FAST)
-                            ? "FLOW_FAST" : "FLOW_SLOW";
-        publishAlert(alert, iv.currentFlowRate);
+        publishAlert(iv.currentFlowRate);
         saveImageToLog();
       }
 
