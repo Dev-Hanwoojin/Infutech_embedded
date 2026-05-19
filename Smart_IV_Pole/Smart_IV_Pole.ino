@@ -1,13 +1,14 @@
 
+
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiProv.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
-#include "esp_system.h"   // ESP.getEfuseMac()
+#include "esp_system.h"
 #include "ads1232.h"
 #include "cnn_detector.h"
+#include "ble_wifi_prov.h"   // 커스텀 BLE WiFi 프로비저닝 (Flutter 앱용)
 
 // ── 펌웨어 버전 ───────────────────────────────────────────────────
 #define FW_VERSION  "1.1.0"
@@ -23,13 +24,15 @@
 #define ADS_GAIN1 32
 
 // ── MQTT 설정 ─────────────────────────────────────────────────────
-#define MQTT_BROKER   "192.168.1.100"   // TODO: 실제 브로커 IP/도메인으로 변경
+// 브로커 사용 시: 실제 IP/도메인 입력  (예: "192.168.1.100" 또는 "broker.example.com")
+// 사용 안 함:    빈 문자열 ""        → 시도 자체를 안 함 (시리얼 깔끔)
+#define MQTT_BROKER   ""
 #define MQTT_PORT     1883
 // #define MQTT_USER  "user"            // 브로커 인증 필요 시 주석 해제
 // #define MQTT_PASS  "pass"
 
 // ── 타이밍 설정 ───────────────────────────────────────────────────
-#define WEIGHT_MS         2000     // 무게 측정 주기 (1초)
+#define WEIGHT_MS         1000     // 무게 측정 주기 (1초)
 #define STATUS_MS         5000     // MQTT 상태 발행 주기 (5초)
 #define MQTT_RETRY_MS     5000     // MQTT 재연결 시도 주기
 #define BOOT_DELAY_MS     2000UL   // 전원 ON 후 영점까지 대기
@@ -40,6 +43,11 @@
 // ── 수액 자동 감지 임계값 ─────────────────────────────────────────
 #define WEIGHT_HANG_G    50.0f   // 수액 감지: 이 이상이면 수액 걸린 것으로 판단
 #define WEIGHT_REMOVE_G  15.0f   // 수액 제거: 이 미만이면 수액 없는 것으로 판단
+
+// ── 수액 안정화 (흔들림 잡기) ────────────────────────────────────
+#define STABILIZE_WINDOW    5       // 안정화 판정에 사용할 최근 측정 샘플 수
+#define STABILIZE_RANGE_G   0.5f    // 윈도우 내 최대-최소 < 이 값이면 안정 판정
+#define STABILIZE_TIMEOUT_MS  30000UL  // 30초 안에 안정 안 되면 강제 교정 진입
 
 // ── 기본 목표 유속 ────────────────────────────────────────────────
 // 앱에서 변경 전까지 사용하는 기본값 (성인용 20gtt/mL 세트)
@@ -72,13 +80,14 @@ char T_INFO[48];     // iv_pole/<ID>/info  (온·오프라인 retained)
 // 부팅 절차 단계 정의
 // =================================================================
 enum IVPhase {
-  PHASE_BOOT,     // 전원 ON — 2초 대기 중
-  PHASE_TARE,     // 자동 영점 조정 중
-  PHASE_WAIT,     // 수액 감지 대기
-  PHASE_CALIB,    // 드립 팩터 교정 중 (60초)
-  PHASE_WARMUP,   // EMA 안정화 대기 (8샘플)
-  PHASE_MONITOR,  // 주입 모니터링 중
-  PHASE_DONE      // 주입 완료
+  PHASE_BOOT,        // 전원 ON — 2초 대기 중
+  PHASE_TARE,        // 자동 영점 조정 중
+  PHASE_WAIT,        // 수액 감지 대기
+  PHASE_STABILIZE,   // 수액 흔들림 잡힐 때까지 대기 (교정 직전)
+  PHASE_CALIB,       // 드립 팩터 교정 중 (60초)
+  PHASE_WARMUP,      // EMA 안정화 대기 (8샘플)
+  PHASE_MONITOR,     // 주입 모니터링 중
+  PHASE_DONE         // 주입 완료
 };
 
 // ─────────────────────────────────────────────────────────────────
@@ -88,6 +97,7 @@ ADS1232      loadCell(ADS_DOUT, ADS_SCLK, ADS_PDWN, ADS_GAIN0, ADS_GAIN1);
 WiFiClient   espClient;
 PubSubClient mqtt(espClient);
 CNNDetector  detector;
+BLEWiFiProv  bleProv;   // BLE 기반 WiFi 프로비저닝 (Flutter 앱)
 
 // ─────────────────────────────────────────────────────────────────
 // IV 상태 구조체
@@ -113,6 +123,12 @@ float         calibWeightStart = 0;
 unsigned long calibStartMs     = 0;
 unsigned long bootMs           = 0;
 
+// 안정화 단계 — 최근 N개 측정값의 변동 추적
+float         stabilizeBuf[STABILIZE_WINDOW] = {0};
+int           stabilizeIdx     = 0;
+int           stabilizeCount   = 0;
+unsigned long stabilizeStartMs = 0;
+
 // ─────────────────────────────────────────────────────────────────
 // 타이밍 변수
 // ─────────────────────────────────────────────────────────────────
@@ -120,15 +136,28 @@ unsigned long lastWeightMs = 0;
 unsigned long lastStatusMs = 0;
 unsigned long lastMqttMs   = 0;
 
+// MQTT 활성화 플래그 — MQTT_BROKER 가 빈 문자열이면 false (시도 자체 안 함)
+const bool mqttEnabled = (MQTT_BROKER[0] != '\0');
+
 // =================================================================
 // 기기 ID 생성 — ESP32 칩 고유 MAC으로 식별
 // =================================================================
 void buildDeviceId() {
-  // ESP32 eFuse MAC (각 기기 고유값, 변경 불가)
-  uint64_t mac = ESP.getEfuseMac();
-  // 뒤 3바이트(24비트)로 충돌 가능성 없는 단축 ID 생성
-  uint32_t suffix = (uint32_t)(mac & 0xFFFFFF);
-  snprintf(deviceId, sizeof(deviceId), "IVPOLE_%06X", suffix);
+  // ★ WiFi.macAddress() 는 WiFi 스택 초기화 후에만 동작 → setup() 초반엔 0 반환.
+  //   ESP.getEfuseMac() 은 eFuse에서 직접 읽으므로 WiFi 초기화 무관.
+  //
+  // ESP.getEfuseMac() 반환값(uint64_t) 바이트 배치:
+  //   bit[ 7: 0] = mac[0]  (OUI 1바이트)
+  //   bit[15: 8] = mac[1]  (OUI 2바이트)
+  //   bit[23:16] = mac[2]  (OUI 3바이트)
+  //   bit[31:24] = mac[3]  ← 기기 고유값 시작
+  //   bit[39:32] = mac[4]
+  //   bit[47:40] = mac[5]  ← 기기 고유값 끝
+  uint64_t chipid = ESP.getEfuseMac();
+  uint8_t  mac[6];
+  for (int i = 0; i < 6; i++) mac[i] = (chipid >> (8 * i)) & 0xFF;
+
+  snprintf(deviceId, sizeof(deviceId), "IVPOLE_%02X%02X%02X", mac[3], mac[4], mac[5]);
   snprintf(bleName,  sizeof(bleName),  "%s", deviceId);
 }
 
@@ -142,49 +171,25 @@ void buildTopics() {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// BLE 프로비저닝 이벤트 콜백
-// ─────────────────────────────────────────────────────────────────
-void onProvEvent(arduino_event_t *ev) {
-  switch (ev->event_id) {
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.printf("[WiFi] 연결됨. IP: %s\n", WiFi.localIP().toString().c_str());
-      break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      Serial.println("[WiFi] 연결 끊김.");
-      break;
-    case ARDUINO_EVENT_PROV_START:
-      Serial.printf("[Prov] BLE 대기 중.  기기명: %s\n", bleName);
-      break;
-    case ARDUINO_EVENT_PROV_CRED_RECV:
-      Serial.println("[Prov] WiFi 자격증명 수신.");
-      break;
-    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
-      Serial.println("[Prov] WiFi 인증 완료.");
-      break;
-    case ARDUINO_EVENT_PROV_END:
-      Serial.println("[Prov] 프로비저닝 완료.");
-      break;
-    default: break;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────
 // MQTT 헬퍼 함수
 // ─────────────────────────────────────────────────────────────────
 
 // 이상 감지 알림 발행
-void publishAlert(const char *type, float measuredFlowRate) {
-  StaticJsonDocument<160> doc;
-  doc["type"]         = type;
+// MQTT 에는 빠름/느림 정보(detail)도 포함시켜 백엔드에서 필요 시 사용
+// 시리얼/사용자 표시는 통합 "수액 이상 발생"
+void publishAlert(float measuredFlowRate) {
+  StaticJsonDocument<192> doc;
+  doc["type"]         = "IV_ANOMALY";                    // 통합 알림 타입
+  doc["detail"]       = detector.getResultDetail();      // "fast" / "slow" (참고용)
   doc["flowMeasured"] = measuredFlowRate;
   doc["flowTarget"]   = iv.targetFlowRate;
   doc["confidence"]   = detector.getWindowConfidence();
   doc["ts"]           = millis();
-  char buf[160];
+  char buf[192];
   serializeJson(doc, buf);
-  mqtt.publish(T_ALERT, buf, true);
-  Serial.printf("[ALERT] %s  신뢰도:%.0f%%\n",
-                type, detector.getWindowConfidence() * 100.0f);
+  if (mqttEnabled) mqtt.publish(T_ALERT, buf, true);
+  Serial.printf("[ALERT] ⚠️ 수액 이상 발생  신뢰도:%.0f%%\n",
+                detector.getWindowConfidence() * 100.0f);
 }
 
 // 현재 상태 발행 (5초 주기)
@@ -222,6 +227,7 @@ void publishOnline() {
 // 브로커가 자동으로 T_INFO에 {"online":false} 를 발행해줌
 // ─────────────────────────────────────────────────────────────────
 bool connectMQTT() {
+  if (!mqttEnabled) return false;                // MQTT 비활성화
   if (mqtt.connected()) return true;
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -367,44 +373,12 @@ void handleSerial() {
   line.trim();
   if (line.length() == 0) return;
 
-  // ── gtt / target : 목표 유속 (gtt/min) 설정 ────────────────────
-  // 동의어: "target 60" == "gtt 60"
-  // 현재 단계에 따라 동작:
-  //   WAIT/STABILIZE 이전 → 다음 교정에 사용
-  //   CALIB 중           → 이번 교정에 즉시 반영
-  //   WARMUP/MONITOR      → 목표 유속 즉시 갱신 + CNN 윈도우 리셋
-  if (line.startsWith("target ") || line.startsWith("gtt ")) {
-    int p = line.indexOf(' ');
-    float v = line.substring(p + 1).toFloat();
-    if (v <= 0 || v > 300) {
-      Serial.println("[DBG] gtt 범위 오류 (1~300). 예) gtt 60");
-    } else {
-      calibTargetGtt = v;
-      Serial.printf("[DBG] ✓ 목표 유속 설정: %.0f gtt/min\n", calibTargetGtt);
-
-      // 단계별 안내
-      switch (ivPhase) {
-        case PHASE_MONITOR:
-        case PHASE_WARMUP: {
-          // 즉시 반영 (재교정 없이 dripFactor 그대로 사용)
-          iv.targetFlowRate = (calibTargetGtt / 60.0f) * iv.dripFactor;
-          detector.reset();
-          Serial.printf("[DBG]   → 즉시 반영: %.4f g/s (dripFactor 유지)\n",
-                        iv.targetFlowRate);
-          Serial.println("[DBG]   ※ 정확한 측정 위해 'reset' 후 재교정 권장");
-          break;
-        }
-        case PHASE_CALIB:
-          Serial.println("[DBG]   → 현재 진행 중인 교정에 적용됨");
-          break;
-        case PHASE_STABILIZE:
-        case PHASE_WAIT:
-          Serial.println("[DBG]   → 곧 시작될 교정에 적용됨");
-          break;
-        default:
-          Serial.println("[DBG]   → 다음 교정 시작 시 적용됨");
-          break;
-      }
+  if (line.startsWith("target ")) {
+    calibTargetGtt = line.substring(7).toFloat();
+    Serial.printf("[DBG] 목표 유속 변경: %.0f gtt/min\n", calibTargetGtt);
+    if (ivPhase == PHASE_MONITOR || ivPhase == PHASE_WARMUP) {
+      iv.targetFlowRate = (calibTargetGtt / 60.0f) * iv.dripFactor;
+      detector.reset();
     }
   } else if (line.startsWith("finish ")) {
     iv.finishWeight = line.substring(7).toFloat();
@@ -415,16 +389,19 @@ void handleSerial() {
   } else if (line == "reset") {
     iv = IVState{};  ivPhase = PHASE_TARE;  detector.reset();
     Serial.println("[DBG] 초기화 → 재영점.");
+  } else if (line == "wifireset") {
+    // 저장된 WiFi 자격증명 삭제 → 재부팅 후 BLE 프로비저닝 모드 진입
+    Serial.println("[DBG] WiFi 자격증명 삭제 후 재부팅...");
+    bleProv.clearStoredCredentials();
+    WiFi.disconnect(true, true);
+    delay(500);
+    ESP.restart();
   } else if (line == "status") {
-    const char *ph[] = { "부팅대기","영점조정","수액대기","흔들림안정화",
-                         "드립팩터교정","EMA안정화","모니터링","완료" };
-    Serial.printf("[STATUS] 단계:%s  W:%.2fg\n"
-                  "         목표:%.0f gtt/min (%.4f g/s)  현재유속:%.4f g/s\n"
-                  "         dripFactor:%.5f g/gtt  종료무게:%.1fg\n"
+    const char *ph[] = { "부팅대기","영점조정","수액대기","흔들림안정화","드립팩터교정","EMA안정화","모니터링","완료" };
+    Serial.printf("[STATUS] 단계:%s  W:%.2fg  유속:%.4f/%.4fg/s  dripF:%.5f\n"
                   "         결과:%s  신뢰도:%.0f%%  CNN:%s  샘플:%d/%d\n",
                   ph[ivPhase], iv.currentWeight,
-                  calibTargetGtt, iv.targetFlowRate, iv.currentFlowRate,
-                  iv.dripFactor, iv.finishWeight,
+                  iv.currentFlowRate, iv.targetFlowRate, iv.dripFactor,
                   detector.getResultLabel(),
                   detector.getWindowConfidence() * 100.0f,
                   detector.isTFLiteActive() ? "ON" : "fallback",
@@ -438,24 +415,8 @@ void handleSerial() {
   } else if (line == "image")   { printImage();   }
   else if (line == "dumplog")   { dumpImageLog(); }
   else if (line == "clearlog")  { clearImageLog();}
-  else if (line == "help" || line == "?") {
-    Serial.println("──── 엔지니어 시리얼 명령어 ────");
-    Serial.println("  gtt <n>       목표 유속(gtt/min) 설정.   예) gtt 60");
-    Serial.println("  target <n>    gtt 와 동일 (alias)");
-    Serial.println("  finish <g>    주입 종료 무게 설정");
-    Serial.println("  tare          영점 조정");
-    Serial.println("  reset         전체 초기화 + 재영점");
-    Serial.println("  wifireset     WiFi 자격증명 삭제 + 재부팅");
-    Serial.println("  status        현재 상태 출력");
-    Serial.println("  tolerance <t> 이상감지 허용 오차 (0~1)");
-    Serial.println("  alpha <a>     EMA 계수 (0.05~0.5)");
-    Serial.println("  image         CNN 이미지 출력");
-    Serial.println("  dumplog       이미지 로그 출력");
-    Serial.println("  clearlog      이미지 로그 삭제");
-  }
   else {
-    Serial.printf("[DBG] 모르는 명령: %s   ('help' 입력하여 명령어 목록 보기)\n",
-                  line.c_str());
+    Serial.println("[DBG] 명령: target/finish/tare/reset/status/tolerance/alpha/image/dumplog/clearlog");
   }
 }
 
@@ -489,33 +450,46 @@ void setup() {
   loadCell.setCalibFactor(CALIB_FACTOR_DEFAULT);
   Serial.printf("[ADS] CalibFactor=%.2f\n", loadCell.getCalibFactor());
 
-  // ── BLE WiFi 프로비저닝 ──────────────────────────────────────────
-  // NVS에 저장된 WiFi 자격증명 있으면 자동 연결,
-  // 없으면 앱에서 BLE로 SSID/PW 전송 필요
-  WiFi.onEvent(onProvEvent);
-  WiFiProv.beginProvision(
-    NETWORK_PROV_SCHEME_BLE,
-    NETWORK_PROV_SCHEME_HANDLER_FREE_BLE,
-    NETWORK_PROV_SECURITY_1,
-    "ivpole01",    // PoP (Proof of Possession) — 앱 페어링 시 요구
-    bleName        // BLE 기기명 = 기기 ID (앱이 QR 스캔 후 자동 매칭)
-  );
-  Serial.println("[WiFi] 프로비저닝 대기 중...");
-  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-    delay(500); Serial.print(".");
+  // ── WiFi 연결 (커스텀 BLE 프로비저닝) ────────────────────────────
+  //
+  // 정책: ★ BLE는 항상 켜둠 ★
+  //   1) 부팅 시 저장된 자격증명으로 WiFi 자동 연결 시도 (최대 10초)
+  //   2) 성공/실패 무관하게 BLE GATT 서버 시작 → 언제든 앱에서 재설정 가능
+  //   3) WiFi 실패 시 연결될 때까지 대기 (앱에서 설정해야 메인 루프 진입)
+  //   4) WiFi 성공 시 바로 메인 루프 진입 (BLE 는 백그라운드 광고 계속)
+  //
+  // BLE 프로토콜은 ble_wifi_prov.h 상단 주석 참조.
+  // Flutter 앱은 flutter_blue_plus 등 표준 BLE 라이브러리 사용.
+
+  bool wifiOk = bleProv.tryStoredCredentials(10000);
+
+  // WiFi 성공 여부와 관계없이 BLE 항상 시작 (언제든 재프로비저닝 가능)
+  Serial.printf("[WiFi] BLE 프로비저닝 광고 시작. 기기명: %s\n", bleName);
+  Serial.println("[WiFi] 앱에서 언제든 WiFi 재설정 가능합니다.");
+  bleProv.begin(bleName);
+
+  if (!wifiOk) {
+    // WiFi 자동 연결 실패 → 앱에서 설정할 때까지 메인 진입 대기
+    Serial.println("[WiFi] WiFi 미연결 — 앱에서 설정 대기 중...");
+    while (WiFi.status() != WL_CONNECTED) {
+      bleProv.loop();
+      delay(50);
+    }
+    Serial.printf("[WiFi] 프로비저닝 완료! IP: %s\n", WiFi.localIP().toString().c_str());
   }
-  Serial.println();
-  if (WiFi.status() != WL_CONNECTED)
-    Serial.println("[WiFi] 미연결 — 오프라인 모드 (MQTT 비활성화).");
 
   // ── CNN 탐지기 초기화 ────────────────────────────────────────────
   if (!detector.begin())
     Serial.println("[CNN] Fallback 모드.");
 
-  // ── MQTT 설정 ────────────────────────────────────────────────────
-  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-  mqtt.setCallback(onMqttMsg);
-  connectMQTT();
+  // ── MQTT 설정 (활성화된 경우만) ──────────────────────────────────
+  if (mqttEnabled) {
+    mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+    mqtt.setCallback(onMqttMsg);
+    connectMQTT();
+  } else {
+    Serial.println("[MQTT] 비활성화 (MQTT_BROKER 미설정)");
+  }
 
   // ── 부팅 타이머 시작 → 2초 후 자동 영점 ──────────────────────────
   bootMs = millis();
@@ -532,16 +506,19 @@ void loop() {
   unsigned long now = millis();
 
   handleSerial();
+  bleProv.loop();   // BLE 백그라운드 처리 (재프로비저닝 콜백 등)
 
   // WiFi 재연결 감시
   if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
 
-  // MQTT 연결 유지 및 재연결
-  if (!mqtt.connected() && now - lastMqttMs > MQTT_RETRY_MS) {
-    lastMqttMs = now;
-    connectMQTT();
+  // MQTT 연결 유지 및 재연결 (활성화된 경우만)
+  if (mqttEnabled) {
+    if (!mqtt.connected() && now - lastMqttMs > MQTT_RETRY_MS) {
+      lastMqttMs = now;
+      connectMQTT();
+    }
+    mqtt.loop();
   }
-  mqtt.loop();
 
   // =================================================================
   // 자동 부팅 절차 상태 머신
@@ -572,12 +549,65 @@ void loop() {
     iv.currentWeight = w;
 
     if (w > WEIGHT_HANG_G) {
-      Serial.printf("[AUTO] 수액 감지 (%.1fg) — 드립 팩터 교정 시작\n", w);
-      Serial.printf("[AUTO] 목표: %.0f gtt/min | 교정 시간: %lu초\n",
-                    calibTargetGtt, CALIB_DURATION_MS / 1000UL);
-      calibWeightStart = loadCell.stableRead(10);
-      calibStartMs     = millis();
-      ivPhase          = PHASE_CALIB;
+      Serial.printf("[AUTO] 수액 감지 (%.1fg) — 흔들림 안정화 대기 시작\n", w);
+      // 안정화 버퍼 초기화
+      for (int i = 0; i < STABILIZE_WINDOW; i++) stabilizeBuf[i] = 0;
+      stabilizeIdx     = 0;
+      stabilizeCount   = 0;
+      stabilizeStartMs = millis();
+      ivPhase          = PHASE_STABILIZE;
+    }
+    return;
+  }
+
+  // ── 3-1단계: 흔들림 안정화 대기 ──────────────────────────────────
+  // 매 1초 측정값을 ring buffer 에 저장, 최근 N개 max-min < 임계값이면 안정.
+  // 30초 초과 시 강제로 교정 진입 (계속 흔들리면 마냥 기다릴 순 없음).
+  if (ivPhase == PHASE_STABILIZE && now - lastWeightMs >= WEIGHT_MS) {
+    lastWeightMs = now;
+    float w = loadCell.readWeight();
+    iv.currentWeight = w;
+
+    // 수액팩이 빠졌으면 다시 대기
+    if (w < WEIGHT_REMOVE_G) {
+      Serial.println("[AUTO] 안정화 중 수액 제거 감지 — 다시 대기.");
+      ivPhase = PHASE_WAIT;
+      return;
+    }
+
+    // ring buffer 에 저장
+    stabilizeBuf[stabilizeIdx] = w;
+    stabilizeIdx = (stabilizeIdx + 1) % STABILIZE_WINDOW;
+    if (stabilizeCount < STABILIZE_WINDOW) stabilizeCount++;
+
+    // 윈도우 가득 차야 판정
+    bool forceContinue = (now - stabilizeStartMs >= STABILIZE_TIMEOUT_MS);
+    if (stabilizeCount >= STABILIZE_WINDOW) {
+      // 최대-최소 차 계산
+      float mn = stabilizeBuf[0], mx = stabilizeBuf[0];
+      for (int i = 1; i < STABILIZE_WINDOW; i++) {
+        if (stabilizeBuf[i] < mn) mn = stabilizeBuf[i];
+        if (stabilizeBuf[i] > mx) mx = stabilizeBuf[i];
+      }
+      float range = mx - mn;
+      Serial.printf("[AUTO] 안정화 중... W:%.2fg  변동:%.2fg (기준 <%.2fg)\n",
+                    w, range, STABILIZE_RANGE_G);
+
+      if (range < STABILIZE_RANGE_G || forceContinue) {
+        if (forceContinue)
+          Serial.println("[AUTO] ⚠️ 안정화 시간 초과 — 강제로 교정 진입");
+        else
+          Serial.println("[AUTO] ✓ 안정화 완료 — 드립 팩터 교정 시작");
+
+        Serial.printf("[AUTO] 목표: %.0f gtt/min | 교정 시간: %lu초\n",
+                      calibTargetGtt, CALIB_DURATION_MS / 1000UL);
+        calibWeightStart = loadCell.stableRead(10);
+        calibStartMs     = millis();
+        ivPhase          = PHASE_CALIB;
+      }
+    } else {
+      Serial.printf("[AUTO] 안정화 샘플 수집 중... W:%.2fg (%d/%d)\n",
+                    w, stabilizeCount, STABILIZE_WINDOW);
     }
     return;
   }
@@ -612,9 +642,10 @@ void loop() {
   }
 
   // =================================================================
-  // 무게 측정 주기 (1초)
+  // 무게 측정 주기 (1초) — WAIT/STABILIZE 단계는 위에서 따로 처리
   // =================================================================
-  if (ivPhase != PHASE_WAIT && now - lastWeightMs >= WEIGHT_MS) {
+  if (ivPhase != PHASE_WAIT && ivPhase != PHASE_STABILIZE
+      && now - lastWeightMs >= WEIGHT_MS) {
     lastWeightMs = now;
 
     iv.prevWeight    = iv.currentWeight;
@@ -653,10 +684,9 @@ void loop() {
       detector.addSample(iv.currentFlowRate, iv.targetFlowRate);
 
       // 이상 감지 — 윈도우 완성 직후 1회만 발동
+      // 빠름/느림 구분 없이 통합 "수액 이상 발생" 알림
       if (detector.detectAnomaly()) {
-        const char *alert = (detector.getWindowResult() == FLOW_FAST)
-                            ? "FLOW_FAST" : "FLOW_SLOW";
-        publishAlert(alert, iv.currentFlowRate);
+        publishAlert(iv.currentFlowRate);
         saveImageToLog();
       }
 
@@ -697,7 +727,7 @@ void loop() {
   }
 
   // ── MQTT 상태 발행 (5초 주기, 모니터링 중에만) ───────────────────
-  if (ivPhase == PHASE_MONITOR && now - lastStatusMs >= STATUS_MS) {
+  if (mqttEnabled && ivPhase == PHASE_MONITOR && now - lastStatusMs >= STATUS_MS) {
     lastStatusMs = now;
     publishStatus();
   }
