@@ -373,12 +373,36 @@ void handleSerial() {
   line.trim();
   if (line.length() == 0) return;
 
-  if (line.startsWith("target ")) {
-    calibTargetGtt = line.substring(7).toFloat();
-    Serial.printf("[DBG] 목표 유속 변경: %.0f gtt/min\n", calibTargetGtt);
-    if (ivPhase == PHASE_MONITOR || ivPhase == PHASE_WARMUP) {
-      iv.targetFlowRate = (calibTargetGtt / 60.0f) * iv.dripFactor;
-      detector.reset();
+  // ── gtt / target : 목표 유속 (gtt/min) 설정 ────────────────────
+  // 동의어: "target 60" == "gtt 60"
+  if (line.startsWith("target ") || line.startsWith("gtt ")) {
+    int p = line.indexOf(' ');
+    float v = line.substring(p + 1).toFloat();
+    if (v <= 0 || v > 300) {
+      Serial.println("[DBG] gtt 범위 오류 (1~300). 예) gtt 60");
+    } else {
+      calibTargetGtt = v;
+      Serial.printf("[DBG] ✓ 목표 유속 설정: %.0f gtt/min\n", calibTargetGtt);
+      switch (ivPhase) {
+        case PHASE_MONITOR:
+        case PHASE_WARMUP:
+          iv.targetFlowRate = (calibTargetGtt / 60.0f) * iv.dripFactor;
+          detector.reset();
+          Serial.printf("[DBG]   → 즉시 반영: %.4f g/s (dripFactor 유지)\n",
+                        iv.targetFlowRate);
+          Serial.println("[DBG]   ※ 정확한 측정 위해 'reset' 후 재교정 권장");
+          break;
+        case PHASE_CALIB:
+          Serial.println("[DBG]   → 현재 진행 중인 교정에 적용됨");
+          break;
+        case PHASE_STABILIZE:
+        case PHASE_WAIT:
+          Serial.println("[DBG]   → 곧 시작될 교정에 적용됨");
+          break;
+        default:
+          Serial.println("[DBG]   → 다음 교정 시작 시 적용됨");
+          break;
+      }
     }
   } else if (line.startsWith("finish ")) {
     iv.finishWeight = line.substring(7).toFloat();
@@ -397,11 +421,15 @@ void handleSerial() {
     delay(500);
     ESP.restart();
   } else if (line == "status") {
-    const char *ph[] = { "부팅대기","영점조정","수액대기","흔들림안정화","드립팩터교정","EMA안정화","모니터링","완료" };
-    Serial.printf("[STATUS] 단계:%s  W:%.2fg  유속:%.4f/%.4fg/s  dripF:%.5f\n"
+    const char *ph[] = { "부팅대기","영점조정","수액대기","흔들림안정화",
+                         "드립팩터교정","EMA안정화","모니터링","완료" };
+    Serial.printf("[STATUS] 단계:%s  W:%.2fg\n"
+                  "         목표:%.0f gtt/min (%.4f g/s)  현재유속:%.4f g/s\n"
+                  "         dripFactor:%.5f g/gtt  종료무게:%.1fg\n"
                   "         결과:%s  신뢰도:%.0f%%  CNN:%s  샘플:%d/%d\n",
                   ph[ivPhase], iv.currentWeight,
-                  iv.currentFlowRate, iv.targetFlowRate, iv.dripFactor,
+                  calibTargetGtt, iv.targetFlowRate, iv.currentFlowRate,
+                  iv.dripFactor, iv.finishWeight,
                   detector.getResultLabel(),
                   detector.getWindowConfidence() * 100.0f,
                   detector.isTFLiteActive() ? "ON" : "fallback",
@@ -415,8 +443,23 @@ void handleSerial() {
   } else if (line == "image")   { printImage();   }
   else if (line == "dumplog")   { dumpImageLog(); }
   else if (line == "clearlog")  { clearImageLog();}
+  else if (line == "help" || line == "?") {
+    Serial.println("──── 엔지니어 시리얼 명령어 ────");
+    Serial.println("  gtt <n>       목표 유속(gtt/min) 설정.   예) gtt 60");
+    Serial.println("  target <n>    gtt 와 동일 (alias)");
+    Serial.println("  finish <g>    주입 종료 무게 설정");
+    Serial.println("  tare          영점 조정");
+    Serial.println("  reset         전체 초기화 + 재영점");
+    Serial.println("  wifireset     WiFi 자격증명 삭제 + 재부팅");
+    Serial.println("  status        현재 상태 출력");
+    Serial.println("  tolerance <t> 이상감지 허용 오차 (0~1)");
+    Serial.println("  alpha <a>     EMA 계수 (0.05~0.5)");
+    Serial.println("  image         CNN 이미지 출력");
+    Serial.println("  dumplog       이미지 로그 출력");
+    Serial.println("  clearlog      이미지 로그 삭제");
+  }
   else {
-    Serial.println("[DBG] 명령: target/finish/tare/reset/status/tolerance/alpha/image/dumplog/clearlog");
+    Serial.printf("[DBG] 모르는 명령: %s   ('help' 입력)\n", line.c_str());
   }
 }
 
