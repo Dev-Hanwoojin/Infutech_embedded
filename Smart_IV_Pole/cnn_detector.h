@@ -7,6 +7,14 @@
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
+// 학습된 모델 헤더 자동 포함 (train/train_cnn.py 실행 시 생성됨).
+// 비어있거나 없으면 CNN_MODEL_AVAILABLE 미정의 → Fallback 모드.
+#if defined(__has_include)
+  #if __has_include("cnn_model.h")
+    #include "cnn_model.h"
+  #endif
+#endif
+
 // ── 유속 상태 정의 ─────────────────────────────────────────────────
 #define FLOW_FAST    1    // 유속 빠름
 #define FLOW_NORMAL  0    // 정상

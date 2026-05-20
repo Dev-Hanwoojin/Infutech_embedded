@@ -178,7 +178,7 @@ lines.append("};")
 lines.append(f"const unsigned int cnn_model_data_len = {n};")
 lines.append("")
 
-with open(OUT_PATH, 'w') as f:
+with open(OUT_PATH, 'w', encoding='utf-8') as f:
     f.write('\n'.join(lines))
 
 print(f"생성 완료: {OUT_PATH}")
