@@ -26,7 +26,8 @@
 #define CNN_WIN  (CNN_DIM * CNN_DIM)   // 16샘플
 
 // ── TFLite Micro 설정 ──────────────────────────────────────────────
-#define TENSOR_ARENA_KB  24
+// 4x4 소형 모델 → 실제 arena 사용 5~8KB. 10KB 면 충분 (BLE+WiFi 공존 위해 절약).
+#define TENSOR_ARENA_KB  10
 #define TENSOR_ARENA_SZ  (TENSOR_ARENA_KB * 1024)
 
 // ── 판정 임계값 ────────────────────────────────────────────────────

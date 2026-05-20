@@ -166,8 +166,13 @@ public:
         setState(IDLE);
 
         size_t total = strlen(_scanJson);
-        Serial.printf("[BLEProv] WiFi 스캔 완료: %d개, JSON %u bytes — 청크 전송 시작\n",
-                      n, (unsigned)total);
+        Serial.printf("[BLEProv] WiFi 스캔 완료: %d개, JSON %u bytes (free heap: %u) — 청크 전송\n",
+                      n, (unsigned)total, ESP.getFreeHeap());
+        if (n == 0) {
+          Serial.println("[BLEProv] ⚠️ 0개 스캔 — 메모리 부족 또는 BLE 간섭 의심.");
+          Serial.printf( "[BLEProv]   free heap 가 너무 낮으면(<40KB) RAM 부족입니다. 현재:%u\n",
+                         ESP.getFreeHeap());
+        }
 
         // ★ 청크 분할 notify — MTU 협상 무관하게 안정적 전송
         //   각 청크 20바이트 (기본 ATT MTU 23 - 헤더 3바이트 안전 마진)
@@ -284,7 +289,7 @@ private:
     WiFi.mode(WIFI_STA);
     WiFi.scanNetworks(true, false);   // 비동기, hidden 제외
     _scanInProgress = true;
-    Serial.println("[BLEProv] WiFi 스캔 시작...");
+    Serial.printf("[BLEProv] WiFi 스캔 시작... (free heap: %u)\n", ESP.getFreeHeap());
   }
 
   // 스캔 결과를 JSON으로 변환 (안전장치 적용)
