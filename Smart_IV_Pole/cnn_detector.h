@@ -48,11 +48,13 @@ public:
       _cnnThresh(DEFAULT_CNN_THRESH),
       _ratioThresh(DEFAULT_RATIO_THRESH),
       _model(nullptr), _interpreter(nullptr),
-      _tfliteReady(false), _useFallback(false)
+      _tfliteReady(false), _useFallback(false),
+      _verbose(false), _inferCount(0)
   {
     memset(_buf,   0, sizeof(_buf));
     memset(_image, 0, sizeof(_image));
     memset(_arena, 0, sizeof(_arena));
+    _lastProb[0] = _lastProb[1] = _lastProb[2] = 0.0f;
   }
 
   // TFLite 모델 초기화. 모델 파일이 없으면 Fallback 모드로 동작.
@@ -187,6 +189,54 @@ public:
     memcpy(out, _image, sizeof(_image));
   }
 
+  // ── 디버그 기능 ───────────────────────────────────────────────────
+  // verbose: true → 매 추론마다 입력 이미지 + 출력 확률/비율 시리얼 출력
+  void setVerbose(bool v) { _verbose = v; }
+  bool getVerbose() const { return _verbose; }
+
+  // 현재 CNN 엔진 상태를 시리얼로 상세 출력 (시리얼 'cnn' 명령에서 호출)
+  void printDebugInfo() {
+    Serial.println("───── CNN 진단 정보 ─────");
+    Serial.printf("  추론 엔진   : %s\n",
+                  _tfliteReady ? "TFLite Micro (학습된 모델)" : "Fallback (픽셀 비율)");
+    Serial.printf("  모델 컴파일 : %s\n",
+#ifdef CNN_MODEL_AVAILABLE
+                  "CNN_MODEL_AVAILABLE 정의됨 (모델 헤더 포함)"
+#else
+                  "정의 안 됨 → cnn_model.h 비어있음 (Fallback 강제)"
+#endif
+    );
+    Serial.printf("  윈도우 크기 : %dx%d = %d 샘플 (%d초)\n",
+                  CNN_DIM, CNN_DIM, CNN_WIN, CNN_WIN);
+    Serial.printf("  누적 추론 수: %lu 회\n", _inferCount);
+    Serial.printf("  현재 수집   : %d / %d 샘플\n", _count, CNN_WIN);
+    Serial.printf("  허용오차    : ±%.0f%%  | CNN임계:%.2f | 비율임계:%.2f\n",
+                  _tolerance * 100.0f, _cnnThresh, _ratioThresh);
+#ifdef CNN_MODEL_AVAILABLE
+    if (_tfliteReady && _interpreter) {
+      Serial.printf("  Arena 사용  : %u / %u bytes\n",
+                    (unsigned)_interpreter->arena_used_bytes(), TENSOR_ARENA_SZ);
+      TfLiteTensor *in  = _interpreter->input(0);
+      TfLiteTensor *out = _interpreter->output(0);
+      Serial.printf("  입력 텐서   : [%d,%d,%d,%d]\n",
+                    in->dims->data[0], in->dims->data[1],
+                    in->dims->data[2], in->dims->data[3]);
+      Serial.printf("  출력 텐서   : [%d,%d]\n",
+                    out->dims->data[0], out->dims->data[1]);
+    }
+#endif
+    if (_hasResult) {
+      Serial.printf("  최근 결과   : %s (신뢰도 %.1f%%)\n",
+                    getResultDetail(), _windowConfidence * 100.0f);
+      Serial.printf("  최근 확률   : slow=%.3f normal=%.3f fast=%.3f\n",
+                    _lastProb[0], _lastProb[1], _lastProb[2]);
+    } else {
+      Serial.println("  최근 결과   : 아직 윈도우 미완성");
+    }
+    Serial.printf("  verbose     : %s\n", _verbose ? "ON" : "OFF");
+    Serial.println("─────────────────────────");
+  }
+
   // 전체 초기화
   void reset() {
     memset(_buf,   0, sizeof(_buf));
@@ -215,6 +265,26 @@ private:
   alignas(16) uint8_t       _arena[TENSOR_ARENA_SZ];
   bool _tfliteReady, _useFallback;
 
+  // ── 디버그 상태 ──
+  bool          _verbose;        // 추론 상세 로그 on/off
+  unsigned long _inferCount;     // 누적 추론 횟수
+  float         _lastProb[3];    // 최근 [slow, normal, fast] 확률/비율
+
+  // verbose 모드일 때 입력 이미지를 시리얼에 출력
+  void printVerboseImage() {
+    Serial.printf("[CNN#%lu] %s 추론 입력 이미지:\n",
+                  _inferCount, _tfliteReady ? "TFLite" : "Fallback");
+    for (int r = 0; r < CNN_DIM; r++) {
+      Serial.print("        ");
+      for (int c = 0; c < CNN_DIM; c++) {
+        if      (_image[r][c] == FLOW_FAST) Serial.print('+');
+        else if (_image[r][c] == FLOW_SLOW) Serial.print('-');
+        else                                Serial.print('.');
+      }
+      Serial.println();
+    }
+  }
+
   // 1차원 버퍼 → 2차원 이미지 변환
   void buildImage() {
     for (int r = 0; r < CNN_DIM; r++)
@@ -224,7 +294,14 @@ private:
 
   // 추론 실행 → _windowResult, _windowConfidence 갱신
   void runClassify() {
+    _inferCount++;
+    if (_verbose) printVerboseImage();
     _tfliteReady ? classifyCNN() : classifyFallback();
+    if (_verbose) {
+      Serial.printf("[CNN#%lu] 결과: %s | 확률 slow=%.3f normal=%.3f fast=%.3f\n",
+                    _inferCount, getResultDetail(),
+                    _lastProb[0], _lastProb[1], _lastProb[2]);
+    }
   }
 
   // TFLite 모델로 3클래스 분류
@@ -245,6 +322,7 @@ private:
     float pSlow   = _interpreter->output(0)->data.f[0];
     float pNormal = _interpreter->output(0)->data.f[1];
     float pFast   = _interpreter->output(0)->data.f[2];
+    _lastProb[0] = pSlow; _lastProb[1] = pNormal; _lastProb[2] = pFast;
 
     if (pNormal >= _cnnThresh) {
       _windowResult     = FLOW_NORMAL;
@@ -270,6 +348,10 @@ private:
 
     float ratioFast = (float)fast / CNN_WIN;
     float ratioSlow = (float)slow / CNN_WIN;
+    // Fallback 은 확률이 아니라 픽셀 비율 — 디버그 표시용으로 저장
+    _lastProb[0] = ratioSlow;
+    _lastProb[1] = 1.0f - ratioFast - ratioSlow;
+    _lastProb[2] = ratioFast;
 
     if      (ratioFast >= _ratioThresh && ratioFast > ratioSlow) {
       _windowResult     = FLOW_FAST;

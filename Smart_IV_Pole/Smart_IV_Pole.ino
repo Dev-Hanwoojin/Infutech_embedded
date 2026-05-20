@@ -440,6 +440,12 @@ void handleSerial() {
   } else if (line.startsWith("alpha ")) {
     float a = constrain(line.substring(6).toFloat(), 0.05f, 0.5f);
     loadCell.setEmaAlpha(a);  Serial.printf("[DBG] EMA alpha=%.2f\n", a);
+  } else if (line == "cnn") {
+    detector.printDebugInfo();
+  } else if (line == "cnnverbose" || line == "cnnv") {
+    detector.setVerbose(!detector.getVerbose());
+    Serial.printf("[DBG] CNN verbose %s\n",
+                  detector.getVerbose() ? "ON (매 추론 상세 출력)" : "OFF");
   } else if (line == "image")   { printImage();   }
   else if (line == "dumplog")   { dumpImageLog(); }
   else if (line == "clearlog")  { clearImageLog();}
@@ -454,6 +460,8 @@ void handleSerial() {
     Serial.println("  status        현재 상태 출력");
     Serial.println("  tolerance <t> 이상감지 허용 오차 (0~1)");
     Serial.println("  alpha <a>     EMA 계수 (0.05~0.5)");
+    Serial.println("  cnn           CNN 엔진 진단 (모드/확률/텐서 정보)");
+    Serial.println("  cnnv          CNN 추론 상세 로그 토글");
     Serial.println("  image         CNN 이미지 출력");
     Serial.println("  dumplog       이미지 로그 출력");
     Serial.println("  clearlog      이미지 로그 삭제");
@@ -522,8 +530,10 @@ void setup() {
   }
 
   // ── CNN 탐지기 초기화 ────────────────────────────────────────────
-  if (!detector.begin())
-    Serial.println("[CNN] Fallback 모드.");
+  if (detector.begin())
+    Serial.println("[CNN] ✓ TFLite 학습 모델 활성화됨.");
+  else
+    Serial.println("[CNN] ⚠️ Fallback 모드 (학습 모델 미탑재). 'cnn' 명령으로 진단.");
 
   // ── MQTT 설정 (활성화된 경우만) ──────────────────────────────────
   if (mqttEnabled) {
