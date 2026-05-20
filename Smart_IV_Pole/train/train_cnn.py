@@ -100,16 +100,24 @@ print(f"학습 샘플: {len(X_train)}  검증 샘플: {len(X_val)}")
 # 4×4 입력에 맞게 단층 Conv 구조 사용
 # TFLite Micro 사용 연산: Conv2D, MaxPool2D, Reshape, FullyConnected, Softmax
 
+# ★ Flatten 대신 고정 크기 Reshape 사용.
+#   Keras Flatten 은 동적 shape 처리를 위해 SHAPE/STRIDED_SLICE/PACK op 을
+#   생성하는데, 이들은 TFLite Micro resolver(5개)에 없어 AllocateTensors 가
+#   실패하고 Fallback 으로 떨어짐. Reshape 로 고정하면 RESHAPE op 만 생성됨.
+_POOLED = (CNN_DIM // 2) * (CNN_DIM // 2) * 8   # 2*2*8 = 32
+
 model = keras.Sequential([
-    keras.layers.Input(shape=(CNN_DIM, CNN_DIM, 1)),
+    # ★ batch_size=1 고정 — 동적 batch(None)면 Reshape 가 SHAPE/STRIDED_SLICE
+    #   /PACK op 을 생성하여 TFLite Micro resolver 와 불일치. 고정 시 RESHAPE만.
+    keras.layers.Input(shape=(CNN_DIM, CNN_DIM, 1), batch_size=1),
 
     # Conv2D(8 필터, 3×3, same 패딩) → 4×4×8
     keras.layers.Conv2D(8, (3, 3), padding='same', activation='relu'),
     # MaxPool(2×2) → 2×2×8
     keras.layers.MaxPooling2D((2, 2)),
 
-    # Flatten → 32
-    keras.layers.Flatten(),
+    # 고정 크기 Reshape → 32  (Flatten 대체)
+    keras.layers.Reshape((_POOLED,)),
     keras.layers.Dense(16, activation='relu'),
     keras.layers.Dense(3,  activation='softmax'),   # slow / normal / fast
 ], name='iv_cnn_4x4')
@@ -145,7 +153,11 @@ if val_acc < 0.90:
 # ── TFLite float32 변환 ────────────────────────────────────────────
 
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
-converter.optimizations = [tf.lite.Optimize.DEFAULT]
+# ★ Optimize.DEFAULT(양자화) 사용 안 함 — 순수 float32 변환.
+#   양자화하면 Quantize/Dequantize op 이 추가되어 TFLite Micro resolver
+#   (Conv2D/MaxPool2D/Reshape/FullyConnected/Softmax 5개)에 없는 op 때문에
+#   AllocateTensors 또는 Invoke 가 실패하고 Fallback 으로 떨어짐.
+#   모델이 6KB로 작으므로 float32 그대로도 메모리 부담 없음.
 tflite_model = converter.convert()
 
 model_size_kb = len(tflite_model) / 1024

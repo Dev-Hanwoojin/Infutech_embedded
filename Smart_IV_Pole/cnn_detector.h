@@ -26,7 +26,7 @@
 #define CNN_WIN  (CNN_DIM * CNN_DIM)   // 16샘플
 
 // ── TFLite Micro 설정 ──────────────────────────────────────────────
-#define TENSOR_ARENA_KB  16
+#define TENSOR_ARENA_KB  24
 #define TENSOR_ARENA_SZ  (TENSOR_ARENA_KB * 1024)
 
 // ── 판정 임계값 ────────────────────────────────────────────────────
