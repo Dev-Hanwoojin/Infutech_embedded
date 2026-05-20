@@ -32,7 +32,7 @@
 // #define MQTT_PASS  "pass"
 
 // ── 타이밍 설정 ───────────────────────────────────────────────────
-#define WEIGHT_MS         1000     // 무게 측정 주기 (1초)
+#define WEIGHT_MS         2000     // 무게 측정 주기 (2초)
 #define STATUS_MS         5000     // MQTT 상태 발행 주기 (5초)
 #define MQTT_RETRY_MS     5000     // MQTT 재연결 시도 주기
 #define BOOT_DELAY_MS     2000UL   // 전원 ON 후 영점까지 대기
@@ -41,8 +41,8 @@
 #define CALIB_DURATION_MS  60000UL   // 교정 측정 시간 (60초)
 
 // ── 수액 자동 감지 임계값 ─────────────────────────────────────────
-#define WEIGHT_HANG_G    50.0f   // 수액 감지: 이 이상이면 수액 걸린 것으로 판단
-#define WEIGHT_REMOVE_G  15.0f   // 수액 제거: 이 미만이면 수액 없는 것으로 판단
+#define WEIGHT_HANG_G    100.0f   // 수액 감지: 이 이상이면 수액 걸린 것으로 판단
+#define WEIGHT_REMOVE_G  80.0f   // 수액 제거: 이 미만이면 수액 없는 것으로 판단
 
 // ── 수액 안정화 (흔들림 잡기) ────────────────────────────────────
 #define STABILIZE_WINDOW    5       // 안정화 판정에 사용할 최근 측정 샘플 수
@@ -442,6 +442,8 @@ void handleSerial() {
     loadCell.setEmaAlpha(a);  Serial.printf("[DBG] EMA alpha=%.2f\n", a);
   } else if (line == "cnn") {
     detector.printDebugInfo();
+  } else if (line == "cnntest") {
+    detector.runSelfTest();
   } else if (line == "cnnverbose" || line == "cnnv") {
     detector.setVerbose(!detector.getVerbose());
     Serial.printf("[DBG] CNN verbose %s\n",
@@ -461,6 +463,7 @@ void handleSerial() {
     Serial.println("  tolerance <t> 이상감지 허용 오차 (0~1)");
     Serial.println("  alpha <a>     EMA 계수 (0.05~0.5)");
     Serial.println("  cnn           CNN 엔진 진단 (모드/확률/텐서 정보)");
+    Serial.println("  cnntest       알려진 패턴으로 추론 검증 (TFLite 증명)");
     Serial.println("  cnnv          CNN 추론 상세 로그 토글");
     Serial.println("  image         CNN 이미지 출력");
     Serial.println("  dumplog       이미지 로그 출력");

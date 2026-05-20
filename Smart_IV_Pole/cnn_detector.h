@@ -202,6 +202,47 @@ public:
   void setVerbose(bool v) { _verbose = v; }
   bool getVerbose() const { return _verbose; }
 
+  // ── 셀프 테스트 ──────────────────────────────────────────────────
+  // 정답을 아는 3가지 패턴(느림/정상/빠름)을 모델에 직접 주입해 추론.
+  // 진짜 학습된 TFLite 모델이 동작하는지 + 확률값이 어떤 형태인지 증명.
+  //   Fallback : 확률이 1/16 배수 (0.0625 단위)로만 나옴
+  //   TFLite   : softmax 임의 실수 (0.9987 등)
+  void runSelfTest() {
+    Serial.println("───── CNN 셀프 테스트 ─────");
+    Serial.printf("  엔진: %s\n",
+                  _tfliteReady ? "TFLite Micro" : "Fallback");
+
+    // 패턴 정의: -1/0/+1 을 4x4 에 채움
+    int patSlow[CNN_DIM][CNN_DIM]   = {{-1,-1,-1,-1},{-1,-1,-1,-1},{0,0,0,0},{0,0,0,0}};
+    int patNormal[CNN_DIM][CNN_DIM] = {{0,0,0,0},{0,1,0,0},{0,0,0,-1},{0,0,0,0}};
+    int patFast[CNN_DIM][CNN_DIM]   = {{1,1,1,1},{1,1,1,1},{0,0,0,0},{0,0,0,0}};
+
+    const char* names[3] = { "느림(SLOW)", "정상(NORMAL)", "빠름(FAST)" };
+    int (*pats[3])[CNN_DIM] = { patSlow, patNormal, patFast };
+    int expect[3] = { FLOW_SLOW, FLOW_NORMAL, FLOW_FAST };
+
+    int pass = 0;
+    for (int t = 0; t < 3; t++) {
+      memcpy(_image, pats[t], sizeof(_image));
+      _tfliteReady ? classifyCNN() : classifyFallback();
+      bool ok = (_windowResult == expect[t]);
+      if (ok) pass++;
+      Serial.printf("  [%s] → 판정:%s  확률 slow=%.4f normal=%.4f fast=%.4f  %s\n",
+                    names[t],
+                    _windowResult==FLOW_FAST ? "빠름" :
+                    _windowResult==FLOW_SLOW ? "느림" : "정상",
+                    _lastProb[0], _lastProb[1], _lastProb[2],
+                    ok ? "OK" : "MISMATCH");
+    }
+    Serial.printf("  결과: %d/3 통과\n", pass);
+    Serial.println("  ※ 확률이 1/16 배수(0.0625단위)면 Fallback,");
+    Serial.println("    0.9987 같은 임의 실수면 진짜 TFLite 추론입니다.");
+    Serial.println("───────────────────────────");
+
+    // 셀프테스트로 _image 가 더럽혀졌으니 실측 윈도우 초기화
+    reset();
+  }
+
   // 현재 CNN 엔진 상태를 시리얼로 상세 출력 (시리얼 'cnn' 명령에서 호출)
   void printDebugInfo() {
     Serial.println("───── CNN 진단 정보 ─────");
