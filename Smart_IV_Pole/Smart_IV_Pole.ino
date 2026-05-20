@@ -139,10 +139,14 @@ unsigned long lastMqttMs   = 0;
 // MQTT 활성화 플래그 — MQTT_BROKER 가 빈 문자열이면 false (시도 자체 안 함)
 const bool mqttEnabled = (MQTT_BROKER[0] != '\0');
 
-// ── 학습 데이터 CSV 로깅 플래그 ───────────────────────────────────
-// 'log on' 시 모니터링 중 매 측정마다 CSV 행을 시리얼로 출력.
-// PC 에서 시리얼 캡처 → "LOG," 로 시작하는 줄만 모아 CSV 파일 생성.
-bool csvLogging = false;
+// ── 학습 데이터 CSV 로깅 ──────────────────────────────────────────
+// 'log <label>' 시 모니터링 중 매 측정마다 라벨 포함 CSV 행을 출력.
+// 실험자가 물리적으로 상황을 만들고(예: 클램프 조여 느리게) 라벨을 지정 →
+// 그 구간 데이터에 자동으로 라벨이 찍힘 (ground-truth, 수동 편집 불필요).
+//   log normal / log slow / log fast  → 로깅 ON + 해당 라벨
+//   log off                            → 로깅 OFF
+// 빈 문자열이면 로깅 OFF.
+char csvLabel[8] = "";
 
 // =================================================================
 // 기기 ID 생성 — ESP32 칩 고유 MAC으로 식별
@@ -445,14 +449,20 @@ void handleSerial() {
   } else if (line.startsWith("alpha ")) {
     float a = constrain(line.substring(6).toFloat(), 0.05f, 0.5f);
     loadCell.setEmaAlpha(a);  Serial.printf("[DBG] EMA alpha=%.2f\n", a);
-  } else if (line == "log on") {
-    csvLogging = true;
-    // CSV 헤더 출력 (PC 에서 이 줄 기준으로 컬럼 파악)
-    Serial.println("LOG_HEADER,ms,flow_gs,target_gs,state");
-    Serial.println("[DBG] CSV 로깅 ON — 'LOG,' 줄을 캡처하세요. label 컬럼은 PC에서 추가.");
   } else if (line == "log off") {
-    csvLogging = false;
+    csvLabel[0] = '\0';
     Serial.println("[DBG] CSV 로깅 OFF");
+  } else if (line.startsWith("log ")) {
+    String lab = line.substring(4);
+    lab.trim();
+    if (lab == "normal" || lab == "slow" || lab == "fast") {
+      snprintf(csvLabel, sizeof(csvLabel), "%s", lab.c_str());
+      Serial.printf("LOG_HEADER,ms,flow_gs,target_gs,state,label\n");
+      Serial.printf("[DBG] CSV 로깅 ON — 라벨:'%s'. 'LOG,' 줄을 캡처하세요.\n", csvLabel);
+      Serial.println("[DBG]   상황 바뀌면 log normal/slow/fast 로 라벨 변경, log off 로 종료.");
+    } else {
+      Serial.println("[DBG] 사용법: log normal | log slow | log fast | log off");
+    }
   } else if (line == "cnn") {
     detector.printDebugInfo();
   } else if (line == "cnntest") {
@@ -475,7 +485,7 @@ void handleSerial() {
     Serial.println("  status        현재 상태 출력");
     Serial.println("  tolerance <t> 이상감지 허용 오차 (0~1)");
     Serial.println("  alpha <a>     EMA 계수 (0.05~0.5)");
-    Serial.println("  log on/off    학습 데이터 CSV 로깅 (시리얼로 측정값 출력)");
+    Serial.println("  log <label>   학습 데이터 CSV 로깅 (normal/slow/fast), log off 종료");
     Serial.println("  cnn           CNN 엔진 진단 (모드/확률/텐서 정보)");
     Serial.println("  cnntest       알려진 패턴으로 추론 검증 (TFLite 증명)");
     Serial.println("  cnnv          CNN 추론 상세 로그 토글");
@@ -753,14 +763,14 @@ void loop() {
       // CNN 샘플 추가 (16개 채워지면 자동 분류)
       detector.addSample(iv.currentFlowRate, iv.targetFlowRate);
 
-      // ── 학습 데이터 CSV 로깅 ──────────────────────────────────────
-      // 형식: LOG,<ms>,<flow_gs>,<target_gs>,<state>
-      //   state: -1=느림 0=정상 1=빠름 (detector 의 단일 샘플 분류값)
-      //   PC 캡처 후 사람이 label 컬럼(slow/normal/fast) 추가
-      if (csvLogging) {
-        Serial.printf("LOG,%lu,%.4f,%.4f,%d\n",
+      // ── 학습 데이터 CSV 로깅 (라벨 포함) ──────────────────────────
+      // 형식: LOG,<ms>,<flow_gs>,<target_gs>,<state>,<label>
+      //   state: -1=느림 0=정상 1=빠름 (detector 단일 샘플 분류값)
+      //   label: log <label> 로 실험자가 지정한 ground-truth
+      if (csvLabel[0] != '\0') {
+        Serial.printf("LOG,%lu,%.4f,%.4f,%d,%s\n",
                       now, iv.currentFlowRate, iv.targetFlowRate,
-                      detector.getLastState());
+                      detector.getLastState(), csvLabel);
       }
 
       // 이상 감지 — 윈도우 완성 직후 1회만 발동
