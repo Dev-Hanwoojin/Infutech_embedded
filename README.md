@@ -1,6 +1,6 @@
 # Smart IV Pole — ESP32 펌웨어 연구개발 노트
 
-> 인퓨테크 미니 스마트 링거 폴대 (Infutech mini Smart IV Pole) 임베디드 시스템
+> 인퓨테크 인퓨미니 스마트 링거 폴대 (Infutech Infumini Smart IV Pole) 임베디드 시스템
 
 | 항목 | 내용 |
 |------|------|
